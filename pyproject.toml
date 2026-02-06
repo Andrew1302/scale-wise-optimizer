@@ -1,0 +1,27 @@
+[project]
+name = "scale-wise-optimizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "pandas",
+    "numpy",
+    "openpyxl",
+    "pandas-stubs>=2.3.2.250926",
+    "dotenv>=0.9.9",
+    "matplotlib>=3.10.7",
+    "seaborn>=0.13.2",
+    "scipy>=1.15.3",
+    "scikit-learn>=1.7.2",
+    "sentence-transformers>=5.2.1",
+    "nbformat>=5.10.4",
+    "nltk>=3.9.2",
+    "nbconvert>=7.17.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[dependency-groups]
+dev = ["ipykernel>=7.1.0"]
