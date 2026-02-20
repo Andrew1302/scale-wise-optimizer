@@ -1,0 +1,122 @@
+{
+  "results": {
+    "mmbench_en_dev": {
+      "alias": "mmbench_en_dev",
+      "gpt_eval_score,none": 69.50171821305841,
+      "gpt_eval_score_stderr,none": "N/A",
+      "submission,none": null,
+      "submission_stderr,none": "N/A"
+    }
+  },
+  "group_subtasks": {
+    "mmbench_en_dev": []
+  },
+  "configs": {
+    "mmbench_en_dev": {
+      "task": "mmbench_en_dev",
+      "dataset_path": "lmms-lab/MMBench",
+      "dataset_name": "en",
+      "dataset_kwargs": {
+        "token": true
+      },
+      "test_split": "dev",
+      "full_docs": false,
+      "process_results_use_image": false,
+      "doc_to_visual": "<function mmbench_doc_to_visual at 0x739288162a70>",
+      "doc_to_text": "<function mmbench_doc_to_text at 0x739288163010>",
+      "doc_to_target": "answer",
+      "process_results": "<function mmbench_process_results at 0x739288163520>",
+      "description": "",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "gpt_eval_score",
+          "aggregation": "<function mmbench_aggregate_dev_results_eval at 0x739288161630>",
+          "higher_is_better": true
+        },
+        {
+          "metric": "submission",
+          "aggregation": "<function mmbench_aggregate_dev_results_submission at 0x739288162830>",
+          "higher_is_better": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "until": [
+          "ASSISTANT:"
+        ],
+        "max_new_tokens": 1024,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "num_beams": 1,
+        "do_sample": false
+      },
+      "repeats": 1,
+      "should_decontaminate": false,
+      "lmms_eval_specific_kwargs": {
+        "default": {
+          "pre_prompt": "",
+          "post_prompt": "\nAnswer with the option's letter from the given choices directly."
+        },
+        "pre_prompt": "",
+        "post_prompt": "\nAnswer with the option's letter from the given choices directly."
+      },
+      "model_specific_generation_kwargs": {
+        "llava": {
+          "image_aspect_ratio": "original"
+        }
+      }
+    }
+  },
+  "versions": {
+    "mmbench_en_dev": "Yaml"
+  },
+  "n-shot": {
+    "mmbench_en_dev": 0
+  },
+  "higher_is_better": {
+    "mmbench_en_dev": {
+      "gpt_eval_score": true,
+      "submission": true
+    }
+  },
+  "n-samples": {
+    "mmbench_en_dev": {
+      "original": 4329,
+      "effective": 4329
+    }
+  },
+  "config": {
+    "model": "qwen2_vl",
+    "model_args": "pretrained=Qwen/Qwen2-VL-2B-Instruct,min_pixels=1000,max_pixels=100000",
+    "batch_size": "1",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": null,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": "",
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "4b4049d",
+  "date": "20260218_051354",
+  "task_hashes": {
+    "mmbench_en_dev": "953557a1594339c1b61d4c9ea9144d0b068199e0188376e59d0b3cf8a454f305"
+  },
+  "model_source": "qwen2_vl",
+  "model_name": "Qwen/Qwen2-VL-2B-Instruct",
+  "model_name_sanitized": "Qwen__Qwen2-VL-2B-Instruct",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 2458975.387768355,
+  "end_time": 2459287.71827834,
+  "total_evaluation_time_seconds": "312.3305099848658"
+}

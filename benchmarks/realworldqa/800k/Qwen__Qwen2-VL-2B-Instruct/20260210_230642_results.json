@@ -1,0 +1,139 @@
+{
+  "results": {
+    "realworldqa": {
+      "alias": "realworldqa",
+      "exact_match,flexible-extract": 0.592156862745098,
+      "exact_match_stderr,flexible-extract": 0.01777944842197779
+    }
+  },
+  "group_subtasks": {
+    "realworldqa": []
+  },
+  "configs": {
+    "realworldqa": {
+      "task": "realworldqa",
+      "dataset_path": "lmms-lab/RealWorldQA",
+      "dataset_kwargs": {
+        "token": true
+      },
+      "test_split": "test",
+      "full_docs": false,
+      "process_results_use_image": false,
+      "doc_to_visual": "<function realworldqa_doc_to_visual at 0x7d1b12701a20>",
+      "doc_to_text": "<function realworldqa_doc_to_text at 0x7d1b11b55ea0>",
+      "doc_to_target": "answer",
+      "description": "",
+      "target_delimiter": " ",
+      "fewshot_delimiter": "\n\n",
+      "num_fewshot": 0,
+      "metric_list": [
+        {
+          "metric": "exact_match",
+          "aggregation": "mean",
+          "higher_is_better": true,
+          "ignore_case": true,
+          "ignore_punctuation": true
+        }
+      ],
+      "output_type": "generate_until",
+      "generation_kwargs": {
+        "max_new_tokens": 16,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "num_beams": 1,
+        "do_sample": false,
+        "until": [
+          "\n\n"
+        ]
+      },
+      "repeats": 1,
+      "filter_list": [
+        {
+          "name": "flexible-extract",
+          "filter": [
+            {
+              "function": "<class 'utils.NumberWordsToDigitsFilter'>"
+            },
+            {
+              "function": "<class 'utils.MultiChoiceRegexFilter'>",
+              "group_select": 0,
+              "ignore_case": true,
+              "ignore_punctuation": true,
+              "regex_pattern": "(\\([A-Z]\\))"
+            }
+          ]
+        }
+      ],
+      "should_decontaminate": false,
+      "metadata": [
+        {
+          "version": 0.0
+        }
+      ],
+      "lmms_eval_specific_kwargs": {
+        "default": {
+          "pre_prompt": "",
+          "post_prompt": ""
+        },
+        "gpt4v": {
+          "pre_prompt": "",
+          "post_prompt": ""
+        },
+        "xcomposer2_4khd": {
+          "pre_prompt": "[UNUSED_TOKEN_146]user\nQuestion: ",
+          "post_prompt": "[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\nThe answer is"
+        },
+        "pre_prompt": "",
+        "post_prompt": ""
+      }
+    }
+  },
+  "versions": {
+    "realworldqa": "Yaml"
+  },
+  "n-shot": {
+    "realworldqa": 0
+  },
+  "higher_is_better": {
+    "realworldqa": {
+      "exact_match": true
+    }
+  },
+  "n-samples": {
+    "realworldqa": {
+      "original": 765,
+      "effective": 765
+    }
+  },
+  "config": {
+    "model": "qwen2_vl",
+    "model_args": "pretrained=Qwen/Qwen2-VL-2B-Instruct,min_pixels=1000,max_pixels=800000",
+    "batch_size": "1",
+    "batch_sizes": [],
+    "device": null,
+    "use_cache": null,
+    "limit": null,
+    "bootstrap_iters": 100000,
+    "gen_kwargs": "",
+    "random_seed": 0,
+    "numpy_seed": 1234,
+    "torch_seed": 1234,
+    "fewshot_seed": 1234
+  },
+  "git_hash": "4b4049d",
+  "date": "20260210_230642",
+  "task_hashes": {
+    "realworldqa": "a0d8b4ab58adef2abf20da47c7db7c531912ec84c9639c50dd9a93475c287266"
+  },
+  "model_source": "qwen2_vl",
+  "model_name": "Qwen/Qwen2-VL-2B-Instruct",
+  "model_name_sanitized": "Qwen__Qwen2-VL-2B-Instruct",
+  "system_instruction": null,
+  "system_instruction_sha": null,
+  "fewshot_as_multiturn": false,
+  "chat_template": null,
+  "chat_template_sha": null,
+  "start_time": 1832143.545217288,
+  "end_time": 1832985.381005244,
+  "total_evaluation_time_seconds": "841.8357879561372"
+}
