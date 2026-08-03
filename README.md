@@ -35,6 +35,26 @@ The accuracy-vs-cost section at the end of this notebook is in-sample by constru
 - `clustering/training/results/cluster_resolution_mapping.csv` — columns: `cluster, n_questions, best_resolution, best_accuracy, efficient_res_95pct, acc_at_95pct, efficient_res_99pct, acc_at_99pct` (`n_questions` counts training rows only)
 - `clustering/training/results/data_split.csv` — columns: `doc_id, split` where `split ∈ {train, test}`
 
+**Section 7 — K-selection diagnostics (reporting only, changes nothing).** Documents how
+well K=30 holds up. Results are cached in three committed CSVs so the section renders
+instantly; set `RECOMPUTE = True` in the diagnostics config cell to regenerate (~18 min
+on CPU). The K grids are written out explicitly so a recompute reproduces the committed
+numbers. Diagnostics sort training rows by `doc_id` first, so they do not depend on the
+split's shuffle order.
+- `k_diag_internal.csv` — silhouette / Calinski-Harabasz / Davies-Bouldin / inertia / cluster sizes for K=2..200
+- `k_diag_cv.csv` — out-of-fold accuracy, cost and **lift** per K (5-fold CV inside the training split)
+- `k_diag_stability.csv` — the same lift re-measured over 8 independent CV partitions
+
+"Lift" is strategy accuracy minus what a *fixed* resolution delivers at the same cost.
+It is the bar that matters: beating "always 800000" while spending less is trivially
+achievable by just picking a cheaper fixed resolution.
+
+Headline findings: silhouette keeps rising past `MAX_K` (peak ≈ K=165), the three internal
+criteria disagree completely, silhouette never exceeds 0.075 at any K (≈ no cluster
+structure), and out-of-fold lift is positive at only 2 of 19 K values — at K=30 it is
+about −0.015, i.e. *below* the fixed-resolution curve. **K=30 is a convention retained for
+continuity, not an optimum.** See the notebook's findings cell for the full write-up.
+
 ### 3. Inference (`clustering/inference/clustering_inference.ipynb`)
 Evaluation notebook. Loads the trained model + mapping CSV + split CSV, filters the benchmark down to the held-out rows, classifies them into clusters via `kmeans.predict` (no re-fitting), assigns resolutions, and produces out-of-sample accuracy vs. computational cost analysis.
 
@@ -78,3 +98,5 @@ EDA-only (the training pipeline does not use them):
 - Always re-run inference after re-running training — the mapping, the model and the split must come from the same run.
 - Notebooks written by script must be normalized before use (`nbformat.validator.normalize`) so every cell carries an `id`; set `nbformat_minor` to 5.
 - Ordering convention: all tables and graphs must be ordered by cluster ID.
+- Executing `clustering_production.ipynb` takes several minutes. Run it in the foreground with a generous timeout — do **not** wrap `nbconvert` in a shell `timeout`, and note that piping to `tail` masks the real exit code (`$?` becomes `tail`'s). Long-running background jobs get killed in this environment.
+- Long sweeps should append results to CSV incrementally and skip K values already on disk, so an interrupted run loses nothing and can be resumed.
