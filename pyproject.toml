@@ -1,7 +1,7 @@
 [project]
 name = "scale-wise-optimizer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Per-cluster image resolution policies for vision-language benchmarks"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
 dependencies = [
@@ -18,10 +18,41 @@ dependencies = [
     "nbformat>=5.10.4",
     "nltk>=3.9.2",
     "nbconvert>=7.17.0",
+    "lmms-eval",
+    "pillow>=10.0.0",
 ]
 
+# The published lmms-eval 0.7.2 wheel ships no `_default_template_yaml` files (they
+# have no extension, and that release predates the `tasks/**/*` package-data glob),
+# so every task fails to load. Pin the commit instead.
+[tool.uv.sources]
+lmms-eval = { git = "https://github.com/EvolvingLMMs-Lab/lmms-eval", rev = "75571cfe0fa36ca5ec2e6aa2bb268f9d38295af3" }
+
 [project.optional-dependencies]
-dev = ["ruff"]
+dev = ["ruff", "pytest>=8.0"]
+
+# Registers `swo.model.BudgetedModel` with lmms-eval. `ModelRegistryV2` reads this
+# group at import time, so `lmms-eval --model resolution_budget` resolves without
+# any change to the lmms-eval installation.
+[project.entry-points."lmms_eval.models"]
+resolution_budget = "swo.registry:MANIFEST"
 
 [dependency-groups]
 dev = ["ipykernel>=7.1.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swo"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -16,16 +16,73 @@ This file provides guidance to AI Agents when working with code in this reposito
 - **Python**: >=3.10, <3.13
 - **Activate venv**: `source .venv/Scripts/activate` (Windows/Git Bash)
 - **Run notebooks**: Use Jupyter or `jupyter nbconvert --to notebook --execute <notebook.ipynb>`
+- **lmms-eval** is pinned to a git commit, not PyPI: the published `0.7.2` wheel omits the
+  `_default_template_yaml` task files (no extension, and that release predates the
+  `tasks/**/*` package-data glob), so every task fails to load. See `[tool.uv.sources]`.
 - **Windows encoding**: Always use `sys.stdout.reconfigure(encoding='utf-8')` in standalone Python scripts (Windows cp1252 causes UnicodeEncodeError)
+
+## Benchmarking (`src/swo/`) — generating the resolution sweep
+
+The clustering notebooks below consume a table of "was this question answered correctly at
+budget X". `src/swo/` is the code that produces that table. It is a Python package, tested
+and linted; the notebooks are not.
+
+**`swo.model.BudgetedModel`** is a custom lmms-eval model that downscales every image to a
+pixel budget and then delegates to a real VLM. It wraps *any* chat-capable lmms-eval model
+rather than subclassing one, so the backend is swappable. Only pixels change — the prompt
+reaching the backend is byte-identical to an unbudgeted run.
+
+It registers through lmms-eval's entry-point plugin group (`[project.entry-points."lmms_eval.models"]`
+in `pyproject.toml`), so nothing in the lmms-eval installation is patched:
+
+```bash
+lmms-eval --model resolution_budget --tasks seedbench_2_plus \
+  --model_args 'backend=vllm,resolution_budget=100000,backend_args={"model":"Qwen/Qwen3-VL-8B-Instruct"}'
+```
+
+**`python -m swo.sweep`** runs the whole sweep and is the normal entry point:
+
+```bash
+python -m swo.sweep --task seedbench_2_plus \
+  --budgets 2000,12500,25000,50000,100000,150000,250000,400000,600000,800000 \
+  --backend vllm --backend-args '{"model": "Qwen/Qwen3-VL-8B-Instruct"}'
+```
+
+It writes `benchmarks/<task>/<model>/samples.csv` (one row per document per budget, carrying
+`original_px`, `sent_px`, the response and the task's per-sample metrics) and `summary.csv`
+(lmms-eval's own aggregate accuracy per budget). `samples.csv` is what the clustering stage
+should consume — it supersedes `seedbench_2_plus_resolution_analysis.xlsx`, which records no
+model identity and whose `Aggregated_Scores` sheet stops at 250000.
+
+The backend is loaded once and reused across budgets, and budgets already present in
+`samples.csv` are skipped, so an interrupted sweep resumes.
+
+### Three things that silently corrupt a sweep
+
+1. **Backend `min_pixels` undoes the downscaling.** Qwen processors re-resize server-side and
+   default to `min_pixels=200704`, which *upscales* a 2,000-px image back to ~200,000 px. Pass
+   a pixel floor below your smallest budget in `--backend-args`, and check the
+   `resolution_budget=... mean X -> Y px/image` line each run logs.
+2. **Never enable lmms-eval's response cache.** It keys on prompt text only
+   (`lmms_eval/caching/response_cache.py`), so it would replay one budget's answers for every
+   other budget. `run_sweep` passes `use_cache=None` explicitly.
+3. **Don't hand-edit `samples.csv`.** Appends are column-aligned against the existing header
+   and a new column raises rather than shifting every row.
+
+`--dry-run` swaps in a backend that loads no weights but still builds every prompt: it
+validates budgets and collects native image sizes without a GPU.
+
+**Development**: `pytest` and `ruff check src tests` / `ruff format src tests`.
 
 ## Architecture
 
-The project is organized as a three-stage pipeline. Each stage is a Jupyter notebook:
+The clustering half of the project is organized as a three-stage pipeline. Each stage is a
+Jupyter notebook:
 
 ### 1. EDA (`clustering/eda/clustering_eda.ipynb`)
 Exploratory analysis only. Loads data, extracts 18 text features, produces distribution plots. No model training.
 
-### 2. Training (`clustering/training/clustering_production.ipynb`)
+### 2. Training (`clustering/training/clustering_training.ipynb`)
 The core pipeline. Loads data, holds out a stratified test set, then — **on the training half only** — generates sentence embeddings (`all-MiniLM-L6-v2`, 384 dims), runs KMeans with silhouette score optimization (K=5..30), performs Friedman statistical tests per cluster, and determines resolution recommendations at three thresholds (best, 95%, 99%). Clustering uses the embeddings alone; no hand-crafted text features are involved.
 
 The accuracy-vs-cost section at the end of this notebook is in-sample by construction and is labelled as such — treat the inference notebook as the source of truth for reported numbers.
@@ -64,13 +121,12 @@ Note: a small cluster can end up with zero held-out questions, so the per-cluste
 
 ### Data flow
 ```
-benchmarks/seedbench_2_plus/test_questions.jsonl  ──┐
-benchmarks/seedbench_2_plus/...resolution_analysis.xlsx ──┤
-                                                          ├──> Training (train split) ──> .pkl + mapping.csv + data_split.csv
-                                                          │                                            │
-                                                          │                                            ▼
-                                                          │                              Inference (test split)
-                                                          └──> EDA (standalone, full dataset)
+python -m swo.sweep ──> benchmarks/<task>/<model>/samples.csv ──┐
+                                                               ├──> Training (train split) ──> .pkl + mapping.csv + data_split.csv
+benchmarks/seedbench_2_plus/test_questions.jsonl  ─────────────┤                                            │
+benchmarks/seedbench_2_plus/...resolution_analysis.xlsx (legacy)┤                                           ▼
+                                                               │                              Inference (test split)
+                                                               └──> EDA (standalone, full dataset)
 ```
 
 ## Key Shared Patterns
@@ -98,5 +154,5 @@ EDA-only (the training pipeline does not use them):
 - Always re-run inference after re-running training — the mapping, the model and the split must come from the same run.
 - Notebooks written by script must be normalized before use (`nbformat.validator.normalize`) so every cell carries an `id`; set `nbformat_minor` to 5.
 - Ordering convention: all tables and graphs must be ordered by cluster ID.
-- Executing `clustering_production.ipynb` takes several minutes. Run it in the foreground with a generous timeout — do **not** wrap `nbconvert` in a shell `timeout`, and note that piping to `tail` masks the real exit code (`$?` becomes `tail`'s). Long-running background jobs get killed in this environment.
+- Executing `clustering_training.ipynb` takes several minutes. Run it in the foreground with a generous timeout — do **not** wrap `nbconvert` in a shell `timeout`, and note that piping to `tail` masks the real exit code (`$?` becomes `tail`'s). Long-running background jobs get killed in this environment.
 - Long sweeps should append results to CSV incrementally and skip K values already on disk, so an interrupted run loses nothing and can be resumed.
