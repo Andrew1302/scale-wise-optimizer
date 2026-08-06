@@ -219,3 +219,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code machine-local settings (the skills alongside it are tracked)
+.claude/settings.local.json
+
+# Scratch sweep runs: `--run-name _something` is the convention for throwaway
+# probes and smoke tests. Real runs are named after the model and are committed.
+benchmarks/*/_*/

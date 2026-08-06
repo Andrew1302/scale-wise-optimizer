@@ -19,6 +19,9 @@ dependencies = [
     "nltk>=3.9.2",
     "nbconvert>=7.17.0",
     "lmms-eval",
+    # Qwen3.5 (model_type "qwen3_5") is unknown to transformers 5.1, which uv
+    # otherwise resolves to.
+    "transformers>=5.14",
     "pillow>=10.0.0",
 ]
 

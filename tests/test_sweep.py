@@ -7,12 +7,15 @@ from swo.model import ResizeRecord
 from swo.sweep import (
     _append_csv,
     _budget_list,
+    _chunk_limit,
     _metric_columns,
     _model_label,
-    _pending_budgets,
+    _recorded_total,
+    _rows_per_budget,
     _sample_rows,
     _slug,
     _summary_row,
+    _total_docs,
 )
 
 TASK = "seedbench_2_plus"
@@ -55,27 +58,117 @@ def test_sample_rows_carry_pixels_and_response():
     results = {"samples": {TASK: [logged_sample(0)]}}
     records = {(TASK, 0): ResizeRecord(n_images=1, original_px=640_000, sent_px=1_936)}
 
-    (row,) = _sample_rows(results, TASK, 2_000, records)
+    (row,) = _sample_rows(results, TASK, 2_000, 0, records)
 
     assert row["budget"] == 2_000
     assert row["response"] == "D"
     assert (row["n_images"], row["original_px"], row["sent_px"]) == (1, 640_000, 1_936)
 
 
+def test_token_counts_are_captured_as_columns():
+    """lmms-eval logs these per sample; they are the evidence a budget reached the model."""
+    sample = {**logged_sample(0), "token_counts": [{"input_tokens": 1234, "output_tokens": 2}]}
+    results = {"samples": {TASK: [sample]}}
+
+    (row,) = _sample_rows(results, TASK, 2_000, 0, {})
+
+    assert (row["input_tokens"], row["output_tokens"]) == (1234, 2)
+
+
+def test_missing_token_counts_are_not_fatal():
+    """Local HF backends report only some counts, and some report none."""
+    results = {"samples": {TASK: [{**logged_sample(0), "token_counts": [None]}]}}
+
+    (row,) = _sample_rows(results, TASK, 2_000, 0, {})
+
+    assert "input_tokens" not in row
+
+
 def test_sample_rows_fail_loudly_when_nothing_was_logged():
     with pytest.raises(RuntimeError, match="no logged samples"):
-        _sample_rows({"samples": {}}, TASK, 2_000, {})
+        _sample_rows({"samples": {}}, TASK, 2_000, 0, {})
+
+
+def test_sample_rows_allow_an_empty_slice_past_the_end():
+    assert _sample_rows({"samples": {TASK: []}}, TASK, 2_000, 9_999, {}) == []
 
 
 def test_summary_row_uses_lmms_eval_aggregates():
     results = {"results": {TASK: {"alias": TASK, f"{TASK}_all,none": 0.42, f"{TASK}_all_stderr,none": "N/A"}}}
     records = {(TASK, 0): ResizeRecord(1, 640_000, 1_936), (TASK, 1): ResizeRecord(1, 320_000, 1_936)}
 
-    row = _summary_row(results, TASK, 2_000, records)
+    row = _summary_row(results, TASK, 2_000, 500, 2_277, records, 12.5)
 
     assert row[f"{TASK}_all,none"] == 0.42
     assert "alias" not in row
-    assert (row["n_docs"], row["mean_original_px"], row["mean_sent_px"]) == (2, 480_000, 1_936)
+    assert (row["budget"], row["offset"], row["n_docs"], row["n_docs_total"]) == (2_000, 500, 2, 2_277)
+    assert (row["mean_original_px"], row["mean_sent_px"]) == (480_000, 1_936)
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"),
+    [(None, 2_277), (100, 100), (9_999, 2_277)],
+)
+def test_total_docs_respects_an_explicit_limit(limit, expected):
+    results = {"n-samples": {TASK: {"original": 2_277, "effective": 2_277}}}
+
+    assert _total_docs(results, TASK, limit) == expected
+
+
+def test_total_docs_is_unknown_when_lmms_eval_does_not_report_it():
+    assert _total_docs({}, TASK, None) is None
+
+
+@pytest.mark.parametrize(
+    ("chunk_size", "limit", "total", "offset", "expected"),
+    [
+        (None, 12, 12, 0, 12),  # unchunked: one invocation for the whole budget
+        (None, None, 2_277, 0, None),  # unchunked, no limit: everything
+        (5, 12, 12, 0, 5),  # a full slice
+        (5, 12, 12, 10, 2),  # the last slice is trimmed to what is left
+        (500, None, 2_277, 2_000, 277),
+        (5, 12, None, 10, 5),  # total unknown: ask for a full slice, detect the short one
+        (5, 12, 12, 12, 0),  # nothing left
+    ],
+)
+def test_chunk_limit_never_overshoots_the_run(chunk_size, limit, total, offset, expected):
+    assert _chunk_limit(chunk_size, limit, total, offset) == expected
+
+
+# -- resume ---------------------------------------------------------------
+
+
+def test_no_rows_yet_means_every_budget_starts_at_zero(tmp_path):
+    assert _rows_per_budget(tmp_path / "missing.csv") == {}
+
+
+def test_row_counts_are_the_resume_cursor(tmp_path):
+    path = tmp_path / "samples.csv"
+    pd.DataFrame([{"budget": 2_000}] * 500 + [{"budget": 12_500}] * 120).to_csv(path, index=False)
+
+    assert _rows_per_budget(path) == {2_000: 500, 12_500: 120}
+
+
+def test_total_is_recovered_from_an_earlier_run(tmp_path):
+    path = tmp_path / "summary.csv"
+    pd.DataFrame([{"budget": 2_000, "n_docs_total": 2_277}]).to_csv(path, index=False)
+
+    assert _recorded_total(path, limit=None) == 2_277
+    assert _recorded_total(path, limit=100) == 100
+
+
+def test_total_is_unknown_before_the_first_run(tmp_path):
+    assert _recorded_total(tmp_path / "missing.csv", limit=None) is None
+
+
+def test_a_summary_without_the_total_column_is_tolerated(tmp_path):
+    path = tmp_path / "summary.csv"
+    pd.DataFrame([{"budget": 2_000}]).to_csv(path, index=False)
+
+    assert _recorded_total(path, limit=None) is None
+
+
+# -- csv appends ----------------------------------------------------------
 
 
 def test_append_csv_creates_then_appends(tmp_path):
@@ -104,15 +197,7 @@ def test_append_csv_rejects_a_new_column_rather_than_shifting_rows(tmp_path):
         _append_csv(pd.DataFrame([{"budget": 12_500, "surprise": 1}]), path)
 
 
-def test_all_budgets_pending_without_an_existing_file(tmp_path):
-    assert _pending_budgets([2_000, 12_500], tmp_path / "missing.csv") == [2_000, 12_500]
-
-
-def test_completed_budgets_are_skipped(tmp_path):
-    path = tmp_path / "samples.csv"
-    pd.DataFrame([{"budget": 2_000}, {"budget": 2_000}]).to_csv(path, index=False)
-
-    assert _pending_budgets([2_000, 12_500], path) == [12_500]
+# -- labelling ------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

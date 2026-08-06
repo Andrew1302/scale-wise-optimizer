@@ -44,18 +44,142 @@ lmms-eval --model resolution_budget --tasks seedbench_2_plus \
 
 ```bash
 python -m swo.sweep --task seedbench_2_plus \
-  --budgets 2000,12500,25000,50000,100000,150000,250000,400000,600000,800000 \
-  --backend vllm --backend-args '{"model": "Qwen/Qwen3-VL-8B-Instruct"}'
+  --budgets 2000,12500,25000,50000,100000,150000,250000,400000,600000 \
+  --chunk-size 500 --backend qwen3_5 \
+  --backend-args '{"pretrained":"Qwen/Qwen3.5-4B","min_pixels":256,"max_pixels":16777216,
+                   "enable_thinking":false,
+                   "system_prompt":"You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."}'
 ```
+
+Every one of those backend args is load-bearing — see "Answer-format compliance"
+and "Pixel budgets vs. the model's own floor" below. Note the budget ladder stops
+at 600,000: SeedBench-2-Plus images are uniformly 800×800 = 640,000 px, so any
+budget at or above that is a no-op identical to the native image.
 
 It writes `benchmarks/<task>/<model>/samples.csv` (one row per document per budget, carrying
 `original_px`, `sent_px`, the response and the task's per-sample metrics) and `summary.csv`
-(lmms-eval's own aggregate accuracy per budget). `samples.csv` is what the clustering stage
+(one row per lmms-eval invocation, with that invocation's own aggregates — a budget-level
+metric is the `n_docs`-weighted mean of its rows). `samples.csv` is what the clustering stage
 should consume — it supersedes `seedbench_2_plus_resolution_analysis.xlsx`, which records no
 model identity and whose `Aggregated_Scores` sheet stops at 250000.
 
-The backend is loaded once and reused across budgets, and budgets already present in
-`samples.csv` are skipped, so an interrupted sweep resumes.
+The backend is loaded once and reused across budgets, and work already in `samples.csv` is
+skipped, so an interrupted sweep resumes. Pass `--chunk-size N` on long runs to make that
+resolution finer than a whole budget.
+
+### Running on the lab GPU VMs
+
+`python -m swo.vm` deploys this package to a lab machine, runs the sweep there in
+`tmux`, waits, and fetches results. One command, no shell scripts, no job configs,
+and **no WSL** — it uses `ssh` + `tar`, both of which Git Bash has.
+
+```bash
+python -m swo.vm check                      # GPUs, sessions, disk — always first
+python -m swo.vm --vm vm03 run -- \
+  --task seedbench_2_plus --budgets 2000,12500,100000,800000 --chunk-size 500 \
+  --backend vllm --backend-args '{"model":"Qwen/Qwen3-VL-8B-Instruct"}'
+python -m swo.vm status | logs | fetch | stop
+```
+
+Targets are `vm03` (default), `vm02` and `c2d`; `--vm` goes before the subcommand.
+Everything after `--` is passed verbatim to `swo.sweep`, so this module never has
+to track sweep's flags. Remote paths mirror the lab's other tooling
+(`/media/<user>/ssd1T/andrew/...`) so the HuggingFace and uv caches are shared;
+`/home` is small and is never written to.
+
+**Recovering from a failure is re-running the same command.** With `--chunk-size`,
+each budget is evaluated in document slices and every finished slice is on disk
+before the next starts; the rows already in `samples.csv` are the resume cursor.
+A crashed slice wrote nothing, so there is no partial state to clean up — no
+sentinels, no merge step. `fetch` is safe mid-run for the same reason.
+
+These are shared machines and **c2d is borrowed from another lab** — `run` refuses
+to start there if its pinned GPU is busy. See `.claude/skills/vm-runs/SKILL.md`
+for the etiquette and the failure catalog.
+
+### Reading the results
+
+```bash
+python -m swo.report benchmarks/seedbench_2_plus/<model> [--markdown]
+```
+
+One row per budget: `n`, `accuracy`, `mean_sent_px`, the token counts lmms-eval
+reported, and `elapsed_s` / `s_per_doc`. **The token columns are the audit**: if
+they don't move with the budget, the backend re-resized the images and the sweep
+measured nothing.
+
+Which token counts exist depends on the backend — local HF backends report
+`output_tokens` only, while API-style ones (`openai`, `async_openai`, `gemini`,
+`async_hf_model`) also report `input_tokens`, which is where vision tokens live.
+
+### Pixel budgets vs. the model's own floor
+
+A budget only binds if the backend's `min_pixels` is below it. Worked example for
+Qwen3.5 (`patch_size=16`, `spatial_merge_size=2`):
+
+- one visual token covers 32×32 = **1,024 px** — the hard floor
+- its `preprocessor_config.json` declares `shortest_edge: 65536`, i.e. a *default*
+  `min_pixels` of 65,536 px — 64 tokens
+- so without `min_pixels` overridden, every budget below 65,536 is **upscaled**,
+  and the four lowest steps of the 2,000–800,000 sweep measure nothing
+
+Pass `min_pixels` low (and `max_pixels` high, or budgets above its default get
+clamped too). Note that going far under a model's default also introduces
+distribution shift, not just information loss — worth separating when reading
+results.
+
+### Answer-format compliance is a confound, not a nuisance
+
+`seedbench_2_plus` scores `pred[0]` — the **first character** of the response
+(`utils.seed_process_result`) — and caps generation at `max_new_tokens: 16`. A
+model that leads with prose is scored wrong no matter how good the answer is, and
+raising `max_new_tokens` alone does not help.
+
+Measured on Qwen3.5-4B, 10 docs × 10 budgets (`enable_thinking=false`):
+
+- responses split almost perfectly: 50 answered with a letter and stopped, 49
+  started explaining and hit the 16-token cap; only 1 case was mixed
+- accuracy over **compliant** answers was **0.80**, versus **0.40** overall
+- compliance **fell with resolution**: 80% at 2,000 px → 40% at ≥100,000 px
+
+That last line is the dangerous one: more visual detail makes the model
+elaborate, which then gets truncated and scored wrong. The formatting effect runs
+*opposite* to the resolution effect, so leaving it uncorrected systematically
+understates the value of high resolution — exactly the quantity this project is
+trying to measure. Always report compliance rate alongside accuracy, and treat any
+resolution curve without it as unreliable.
+
+**The fix is a directive `system_prompt`.** The task's own `post_prompt` is not
+enough for Qwen; the instruction has to arrive at the system level:
+
+```json
+"system_prompt": "You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."
+```
+
+Measured on Qwen3.5-4B at budgets 2,000 and 800,000 (10 docs each):
+
+| config | compliance | output tokens | s/doc |
+|---|---:|---:|---:|
+| `enable_thinking=true`, 16 tokens (lmms-eval default) | 0% | 16.0 | 0.40 |
+| `enable_thinking=false`, 16 tokens | 51% | 6–10 | 0.33 |
+| `enable_thinking=true`, 512 tokens | 50% | 408 | 5.90 |
+| `enable_thinking=false` **+ system_prompt** | **100%** | **2.0** | **0.28** |
+
+It is also the cheapest option — one-letter answers cut generation to 2 tokens.
+
+Two things this table settles. **Thinking mode is a trap for this task**: at 512
+tokens half the responses came back *empty*, because `_strip_thinking` returns
+whatever follows `</think>` and the block never closed — 18× the latency for no
+gain. And **`enable_thinking` defaults to `True`** in
+`lmms_eval/models/simple/qwen3_5.py`, so the out-of-the-box configuration scores
+0.00 at every budget.
+
+This is calibrated on the Qwen3/Qwen3.5 family, which is where it was measured,
+but the failure mode is generic — any chatty instruction-tuned VLM on a task
+scored by `pred[0]` can do this. **Check the compliance rate on 10 samples before
+starting any sweep with a new model**, and adjust the system prompt if it is not
+~100%. Note that `system_prompt` is a per-backend argument: the qwen/HF backends
+accept it, others may not.
 
 ### Three things that silently corrupt a sweep
 

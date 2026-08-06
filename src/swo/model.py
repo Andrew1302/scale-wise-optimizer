@@ -121,7 +121,14 @@ class BudgetedModel(lmms):
         self.backend.set_cache_hook(cache_hook)
 
     def clean(self) -> None:
-        self.backend.clean()
+        """Deliberately a no-op — the backend must outlive one evaluation.
+
+        ``lmms_eval.evaluator.evaluate`` calls ``clean()`` after *every*
+        invocation, and the base implementation deletes every ``nn.Module``
+        attribute. A sweep calls the evaluator once per budget against this same
+        instance, so delegating would delete the weights after the first budget
+        and break the second. Memory is reclaimed when the process exits.
+        """
 
     # -- generation --------------------------------------------------------
 

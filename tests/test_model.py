@@ -188,6 +188,25 @@ def test_rejects_backend_args_alongside_a_built_backend(backend):
         BudgetedModel(backend=backend, resolution_budget=BUDGET, backend_args={"model": "x"})
 
 
+def test_clean_does_not_reach_the_backend(model, backend):
+    """The evaluator cleans after every budget; delegating would free the weights."""
+    backend.clean = lambda: pytest.fail("backend.clean() would delete the loaded model")
+
+    model.clean()
+
+
+def test_the_same_backend_serves_every_budget(model, backend):
+    """A sweep evaluates budget after budget against one loaded backend."""
+    docs = {0: make_doc(picture(800, 600))}
+
+    evaluate(model, docs)
+    model.clean()  # what the evaluator does between budgets
+    model.resolution_budget = 5_000
+    evaluate(model, docs)
+
+    assert len(backend.built) == 2
+
+
 def test_loglikelihood_is_unsupported(model):
     with pytest.raises(NotImplementedError):
         model.loglikelihood([])
