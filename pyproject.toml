@@ -33,6 +33,9 @@ lmms-eval = { git = "https://github.com/EvolvingLMMs-Lab/lmms-eval", rev = "7557
 
 [project.optional-dependencies]
 dev = ["ruff", "pytest>=8.0"]
+# Only installed on the GPU VMs (`swo.vm serve`): vllm publishes no Windows
+# wheels, and it pins torch exactly, so the marker keeps laptops resolvable.
+vllm = ["vllm>=0.26 ; sys_platform == 'linux'"]
 
 # Registers `swo.model.BudgetedModel` with lmms-eval. `ModelRegistryV2` reads this
 # group at import time, so `lmms-eval --model resolution_budget` resolves without

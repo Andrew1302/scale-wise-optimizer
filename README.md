@@ -97,6 +97,59 @@ These are shared machines and **c2d is borrowed from another lab** — `run` ref
 to start there if its pinned GPU is busy. See `.claude/skills/vm-runs/SKILL.md`
 for the etiquette and the failure catalog.
 
+### Two backends: in-process HF, or a vLLM server
+
+| backend | `system_prompt` | `input_tokens` | throughput |
+|---|:-:|:-:|---|
+| `qwen3_5` (in-process HF) | yes | no — output only | one document at a time |
+| `vllm` (in-process) | **no** | **no counts at all** | batched |
+| `openai` | **no** | yes | 32 concurrent |
+| **`async_openai`** (vLLM server) | yes | **yes** (`usage.prompt_tokens`) | adaptive, 1→128 |
+
+`async_openai` is the only backend with both, which is why it is the one to use
+against a served model. `openai` looks equivalent but has no `system_prompt`, and
+losing that costs ~50 points of answer-format compliance.
+
+```bash
+# start once; the server outlives any number of sweeps
+python -m swo.vm --vm c2d serve --model Qwen/Qwen3.5-4B --gpu-memory-utilization 0.9
+
+python -m swo.vm --vm c2d run -- --task seedbench_2_plus \
+  --budgets 2000,12500,25000,50000,100000,150000,250000,400000,600000 \
+  --chunk-size 500 --backend async_openai \
+  --backend-args '{"model_version":"Qwen/Qwen3.5-4B","base_url":"http://127.0.0.1:8000/v1",
+                   "api_key":"EMPTY","system_prompt":"You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."}'
+
+python -m swo.vm --vm c2d serve-stop
+```
+
+Measured on c2d (one RTX 5090, Qwen3.5-4B, 200 documents at native resolution):
+**0.06 s/doc vs 0.28–0.33 s/doc** in-process — about **5× faster**, with 100%
+answer compliance and real `input_tokens`. The gain needs a few hundred documents
+to show; at 10 documents the adaptive concurrency never ramps and the two paths
+look equivalent.
+
+`serve` installs the `vllm` extra, waits for `/health`, and prints the exact
+backend args. Three things move when you switch:
+
+- **Thinking is disabled server-side.** `async_openai` has no per-request
+  `chat_template_kwargs`, so the switch lives on the server:
+  `--default-chat-template-kwargs '{"enable_thinking": false}'`, which `serve`
+  passes by default. Without it a reasoning model spends its whole token budget
+  thinking and **every answer scores wrong** — measured 0% compliance.
+
+- **`min_pixels` moves server-side.** The image processor now lives in vLLM, so
+  the floor is `--min-pixels` on `serve`, not a backend arg. Leaving it at the
+  model default reinstates Qwen3.5's 65,536-px floor and silently upscales every
+  low budget. The default here is 256; `--max-pixels` defaults above the largest
+  budget.
+- **vLLM pre-allocates GPU memory** for the server's whole life
+  (`--gpu-memory-utilization`, default 0.9). On a shared box, set it to what you
+  actually need. `--tensor-parallel-size` and `--gpus` shard across cards.
+
+`async_openai` does *not* resize images: its `max_pixels`/`min_pixels` feed only
+`video_kwargs`, so the budget still binds exactly as with the HF backend.
+
 ### Reading the results
 
 ```bash

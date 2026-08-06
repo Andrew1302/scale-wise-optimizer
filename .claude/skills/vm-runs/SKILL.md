@@ -14,11 +14,55 @@ has `ssh` and `tar`, which is all this uses.
 ```bash
 python -m swo.vm check                      # GPUs, sessions, disk — do this first
 python -m swo.vm run -- <swo.sweep flags>   # deploy → launch → wait → fetch
-python -m swo.vm status                     # alive? how many rows written?
-python -m swo.vm logs [--tail N]
+python -m swo.vm status                     # alive? server healthy? rows written?
+python -m swo.vm logs [--tail N] [--server]
 python -m swo.vm fetch                      # safe mid-run
-python -m swo.vm stop
+python -m swo.vm stop                       # kill the sweep
+
+python -m swo.vm serve --model <hf-repo> [--gpu-memory-utilization 0.9]
+python -m swo.vm serve-stop
 ```
+
+## Serving with vLLM (preferred for real sweeps)
+
+`serve` starts a vLLM OpenAI server in its own tmux session and blocks until
+`/health` answers. It **outlives any number of sweeps** — start it once, run many
+sweeps against it, stop it when done. Weights load once.
+
+Pair it with the **`async_openai`** backend, not `openai`: `openai` has no
+`system_prompt`, and losing that drops answer-format compliance from 100% to ~51%.
+`async_openai` is the only backend with both `system_prompt` and real
+`input_tokens` (`usage.prompt_tokens`).
+
+```bash
+python -m swo.vm --vm c2d serve --model Qwen/Qwen3.5-4B --gpu-memory-utilization 0.9
+# `serve` prints the exact --backend-args to use; then:
+python -m swo.vm --vm c2d run -- --task seedbench_2_plus --budgets ... \
+  --chunk-size 500 --backend async_openai --backend-args '{...}'
+python -m swo.vm --vm c2d serve-stop
+```
+
+Measured: **0.06 s/doc** vs 0.28–0.33 in-process (Qwen3.5-4B, 200 docs, one 5090)
+— about 5×. Needs a few hundred documents before the adaptive concurrency ramps.
+
+Three traps when serving:
+
+- **Thinking must be disabled on the server.** `async_openai` has no per-request
+  `chat_template_kwargs` (only the `openai` backend has `enable_thinking_kwarg`),
+  so `serve` passes `--default-chat-template-kwargs '{"enable_thinking": false}'`
+  by default. Leave it on and a reasoning model scores **0%** — it never reaches
+  an answer. `--enable-thinking` turns it back on if a run genuinely needs it.
+
+- **`min_pixels` moves server-side.** The image processor lives in vLLM now, so
+  the floor is `--min-pixels` on `serve` (default 256), *not* a backend arg.
+  Leave it at the model default and Qwen3.5's 65,536-px floor silently upscales
+  every low budget.
+- **vLLM pre-allocates GPU memory** and holds it for the server's whole life.
+  `--gpu-memory-utilization` (default 0.9) is the knob; drop it on a busy box.
+  `--tensor-parallel-size N` + `--gpus 0,1` shards a model across cards.
+
+**Always `serve-stop` when you are done on a shared machine** — an idle server
+sits on the card indefinitely. `check` and `status` both report whether one is up.
 
 `--vm vm03|vm02|c2d` (default `vm03`) goes **before** the subcommand.
 Everything after `--` is passed verbatim to `swo.sweep`, so any sweep flag works

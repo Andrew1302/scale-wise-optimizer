@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import shlex
 import subprocess
@@ -43,6 +44,25 @@ RESULTS_PATH = "benchmarks"
 
 #: A GPU holding more than this is treated as in use by someone else.
 BUSY_GPU_MIB = 4096
+
+#: tmux session holding the vLLM server. Separate from the sweep's, so the server
+#: outlives any one sweep — load the weights once, evaluate against it many times.
+SERVER_SESSION = "swo_vllm"
+
+#: Dependency sync runs in tmux too: installing vllm pulls ~10 GB of CUDA wheels,
+#: and a foreground ssh command dies with the connection.
+SETUP_SESSION = "swo_setup"
+DEFAULT_PORT = 8000
+
+#: vLLM pre-allocates this fraction of the card up front. Whoever holds it holds it
+#: for the server's whole life, so it is a deliberate, visible knob.
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+
+#: Without this, chatty models lead with prose and are scored wrong — the task is
+#: graded on the response's first character. See the README on compliance.
+MCQ_SYSTEM_PROMPT = (
+    "You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,8 +176,24 @@ def _succeeds(vm: VM, command: str) -> bool:
     return ssh(vm, command, check=False).returncode == 0
 
 
+def _target(session: str) -> str:
+    """A tmux target that matches exactly.
+
+    Without the leading ``=`` tmux matches on prefix, so ``-t swo`` also resolves
+    ``swo_vllm`` — which made `status` report a phantom sweep and would have let
+    `stop` kill the model server.
+    """
+    return shlex.quote(f"={session}")
+
+
 def session_alive(vm: VM, name: str) -> bool:
-    return _succeeds(vm, f"tmux has-session -t {shlex.quote(name)} 2>/dev/null")
+    return _succeeds(vm, f"tmux has-session -t {_target(name)} 2>/dev/null")
+
+
+def _session_exit_code(vm: VM, log: str) -> int | None:
+    """The exit code a finished session left behind, or None if it never wrote one."""
+    written = ssh(vm, f"cat {shlex.quote(vm.run_dir)}/{log}.exit_code 2>/dev/null || true", check=False).stdout.strip()
+    return int(written) if written.lstrip("-").isdigit() else None
 
 
 # -- commands -------------------------------------------------------------
@@ -182,7 +218,7 @@ def check(vm: VM) -> list[str]:
     return busy
 
 
-def deploy(vm: VM) -> None:
+def deploy(vm: VM, extras: tuple[str, ...] = ()) -> None:
     """Upload the package and sync dependencies. Idempotent."""
     repo = Path(__file__).resolve().parents[2]
     present = [path for path in UPLOAD_PATHS if (repo / path).exists()]
@@ -201,39 +237,52 @@ def deploy(vm: VM) -> None:
         check=True,
     )
 
-    logger.info(f"[{vm.host}] uv sync")
-    setup = "\n".join(
-        [
-            "set -e",
-            vm.env_exports(),
-            'mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TMPDIR"',
-            # Installs uv on first use, so a fresh VM needs no manual bootstrap.
-            "command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh",
-            f"cd {shlex.quote(vm.workdir)}",
-            "uv sync",
-        ]
-    )
-    ssh(vm, f"bash -lc {shlex.quote(setup)}", capture=False)
+    # Run the sync inside tmux and poll: `uv sync --extra vllm` downloads ~10 GB of
+    # CUDA wheels, and a foreground ssh command dies with the connection. In tmux it
+    # survives, and re-running deploy attaches to the sync already in flight.
+    if session_alive(vm, SETUP_SESSION):
+        logger.info(f"[{vm.host}] a dependency sync is already running — waiting for it")
+    else:
+        # --inexact: a plain `uv sync` prunes everything outside the resolved set,
+        # so deploying a sweep would uninstall the vllm extra a running server needs.
+        sync = " ".join(
+            ["uv sync --inexact", *(f"--extra {shlex.quote(extra)}" for extra in extras)],
+        )
+        setup = "\n".join(
+            [
+                'mkdir -p "$HF_HOME" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TMPDIR"',
+                # Installs uv on first use, so a fresh VM needs no manual bootstrap.
+                "command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh",
+                sync,
+            ]
+        )
+        logger.info(f"[{vm.host}] {sync}")
+        _start_session(vm, SETUP_SESSION, setup, "setup.log")
+
+    while session_alive(vm, SETUP_SESSION):
+        time.sleep(15)
+    code = _session_exit_code(vm, "setup.log")
+    if code:
+        raise SystemExit(f"dependency sync failed (exit {code}) — see `swo.vm logs --setup`")
+    logger.info(f"[{vm.host}] dependencies ready")
 
 
-def launch(vm: VM, name: str, sweep_args: list[str]) -> None:
-    """Start the sweep in a detached tmux session, teeing to a log."""
-    if session_alive(vm, name):
-        raise SystemExit(f"tmux session {name!r} is already running — `stop` it first, or `logs` to watch it.")
-
-    command = "python -m swo.sweep " + " ".join(shlex.quote(arg) for arg in sweep_args)
+def _start_session(vm: VM, session: str, command: str, log: str, env_overrides: str = "") -> None:
+    """Run ``command`` in a detached tmux session, logging to ``run_dir/<log>``."""
     launcher = f"""#!/bin/bash
 # Written by swo.vm — do not edit on the VM.
 set -u
 mkdir -p {shlex.quote(vm.run_dir)}
-rm -f {shlex.quote(vm.run_dir)}/exit_code
+rm -f {shlex.quote(vm.run_dir)}/{log}.exit_code
 # Redirected straight to the file, not through `tee`: a process substitution
 # can be torn down before it flushes, which loses the whole log — including the
 # traceback you need. Nothing attaches to the tmux pane; `logs` tails this file.
-exec > {shlex.quote(vm.run_dir)}/run.log 2>&1
+exec > {shlex.quote(vm.run_dir)}/{log} 2>&1
 {vm.env_exports()}
+{env_overrides}
 cd {shlex.quote(vm.workdir)}
-source .venv/bin/activate
+# Guarded: the dependency-sync session is what creates .venv in the first place.
+[ -f .venv/bin/activate ] && source .venv/bin/activate
 echo "[start] $(date -Iseconds)"
 echo "[cmd]"
 # Quoted heredoc, not echo: the command carries JSON, and bash would eat the
@@ -243,10 +292,10 @@ cat <<'SWO_CMD_EOF'
 SWO_CMD_EOF
 {command}
 ec=$?
-echo "$ec" > {shlex.quote(vm.run_dir)}/exit_code
+echo "$ec" > {shlex.quote(vm.run_dir)}/{log}.exit_code
 echo "[end] $(date -Iseconds) exit=$ec"
 """
-    path = f"{vm.run_dir}/launch.sh"
+    path = f"{vm.run_dir}/{session}.sh"
     subprocess.run(
         [*_ssh_argv(vm), f"mkdir -p {shlex.quote(vm.run_dir)} && cat > {shlex.quote(path)}"],
         # Bytes, not text: on Windows a text-mode pipe rewrites \n as \r\n, and
@@ -254,12 +303,114 @@ echo "[end] $(date -Iseconds) exit=$ec"
         input=launcher.encode(),
         check=True,
     )
-    ssh(vm, f"chmod +x {shlex.quote(path)} && tmux new-session -d -s {shlex.quote(name)} 'bash {shlex.quote(path)}'")
+    ssh(vm, f"chmod +x {shlex.quote(path)} && tmux new-session -d -s {shlex.quote(session)} 'bash {shlex.quote(path)}'")
+
+
+def launch(vm: VM, name: str, sweep_args: list[str]) -> None:
+    """Start the sweep in a detached tmux session, logging to run.log."""
+    if session_alive(vm, name):
+        raise SystemExit(f"tmux session {name!r} is already running — `stop` it first, or `logs` to watch it.")
+
+    command = "python -m swo.sweep " + " ".join(shlex.quote(arg) for arg in sweep_args)
+    _start_session(vm, name, command, "run.log")
+
     # A short run can already be over by the time we look, so the sentinel counts
     # as evidence the launcher ran — otherwise a fast failure reads as "never started".
-    if not session_alive(vm, name) and not _succeeds(vm, f"test -f {shlex.quote(vm.run_dir)}/exit_code"):
+    if not session_alive(vm, name) and not _succeeds(vm, f"test -f {shlex.quote(vm.run_dir)}/run.log.exit_code"):
         raise SystemExit(f"tmux session {name!r} did not start — check `swo.vm logs`")
     logger.info(f"[{vm.host}] running in tmux session {name!r}")
+
+
+# -- vLLM OpenAI-compatible server ----------------------------------------
+
+
+def serve_command(
+    model: str,
+    port: int = DEFAULT_PORT,
+    gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
+    tensor_parallel_size: int = 1,
+    min_pixels: int = 256,
+    max_pixels: int = 16_777_216,
+    max_model_len: int | None = None,
+    enable_thinking: bool = False,
+    extra: str = "",
+) -> str:
+    """The `vllm serve` command line.
+
+    Two of these are load-bearing for correctness, not tuning:
+
+    ``min_pixels`` / ``max_pixels`` go to the *server*, because that is where the
+    image processor now lives. Leaving them at the model's defaults reinstates
+    Qwen3.5's 65,536-pixel floor and silently upscales every low budget.
+
+    ``enable_thinking`` defaults to False because the per-request switch does not
+    exist on this path — the ``async_openai`` backend has no ``chat_template_kwargs``.
+    Left on, a reasoning model spends the whole token budget thinking and every
+    answer is scored wrong.
+    """
+    processor_kwargs = json.dumps({"min_pixels": int(min_pixels), "max_pixels": int(max_pixels)})
+    template_kwargs = json.dumps({"enable_thinking": bool(enable_thinking)})
+    parts = [
+        "vllm serve",
+        shlex.quote(model),
+        f"--port {int(port)}",
+        f"--gpu-memory-utilization {float(gpu_memory_utilization)}",
+        f"--tensor-parallel-size {int(tensor_parallel_size)}",
+        f"--mm-processor-kwargs {shlex.quote(processor_kwargs)}",
+        f"--default-chat-template-kwargs {shlex.quote(template_kwargs)}",
+    ]
+    if max_model_len:
+        parts.append(f"--max-model-len {int(max_model_len)}")
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def server_healthy(vm: VM, port: int = DEFAULT_PORT) -> bool:
+    return _succeeds(vm, f"curl -sf -m 5 http://127.0.0.1:{int(port)}/health >/dev/null")
+
+
+def serve(
+    vm: VM, model: str, port: int = DEFAULT_PORT, timeout_s: int = 1800, gpus: str | None = None, **kwargs
+) -> str:
+    """Start the vLLM server and block until it answers /health.
+
+    Returns the base_url to hand to the ``async_openai`` backend. The server
+    lives in its own tmux session so it survives any number of sweeps — weights
+    load once, not per budget and not per run.
+    """
+    if server_healthy(vm, port):
+        logger.info(f"[{vm.host}] server already healthy on :{port}")
+        return f"http://127.0.0.1:{port}/v1"
+    if session_alive(vm, SERVER_SESSION):
+        raise SystemExit(
+            f"{SERVER_SESSION!r} is running but not answering /health — `serve-stop` and retry, or `serve-logs`."
+        )
+
+    command = serve_command(model, port=port, **kwargs)
+    logger.info(f"[{vm.host}] starting vLLM: {command}")
+    override = f"export CUDA_VISIBLE_DEVICES={shlex.quote(gpus)}" if gpus else ""
+    _start_session(vm, SERVER_SESSION, command, "server.log", env_overrides=override)
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if server_healthy(vm, port):
+            logger.info(f"[{vm.host}] server ready on :{port}")
+            return f"http://127.0.0.1:{port}/v1"
+        if not session_alive(vm, SERVER_SESSION):
+            raise SystemExit(f"vLLM exited during startup — `swo.vm serve-logs --vm {vm_name(vm)}`")
+        time.sleep(10)
+    raise SystemExit(f"vLLM did not answer /health within {timeout_s}s — check `serve-logs`")
+
+
+def stop_server(vm: VM) -> None:
+    ssh(vm, f"tmux kill-session -t {_target(SERVER_SESSION)} 2>/dev/null || true", check=False)
+    logger.info(f"[{vm.host}] vLLM server stopped")
+
+
+def vm_name(vm: VM) -> str:
+    """The profile name a VM came from, for use in error messages."""
+    return next((name for name, known in VMS.items() if known.host == vm.host), vm.host)
 
 
 def status(vm: VM, name: str) -> int | None:
@@ -270,9 +421,12 @@ def status(vm: VM, name: str) -> int | None:
         f"cd {shlex.quote(vm.workdir)} 2>/dev/null && wc -l {RESULTS_PATH}/*/*/samples.csv 2>/dev/null || true",
         check=False,
     ).stdout.strip()
-    exit_code = ssh(vm, f"cat {shlex.quote(vm.run_dir)}/exit_code 2>/dev/null || true", check=False).stdout.strip()
+    exit_code = ssh(
+        vm, f"cat {shlex.quote(vm.run_dir)}/run.log.exit_code 2>/dev/null || true", check=False
+    ).stdout.strip()
 
     logger.info(f"[{vm.host}] session {name!r}: {'RUNNING' if alive else 'not running'}")
+    logger.info(f"[{vm.host}] vLLM server: {'healthy' if server_healthy(vm) else 'not serving'}")
     if progress:
         logger.info(f"[{vm.host}] rows written (header included):\n{progress}")
     if not alive and exit_code:
@@ -311,12 +465,12 @@ def fetch(vm: VM) -> Path:
     return repo / RESULTS_PATH
 
 
-def logs(vm: VM, tail: int) -> None:
-    print(ssh(vm, f"tail -n {tail} {shlex.quote(vm.run_dir)}/run.log 2>/dev/null || echo '(no log yet)'").stdout)
+def logs(vm: VM, tail: int, log: str = "run.log") -> None:
+    print(ssh(vm, f"tail -n {tail} {shlex.quote(vm.run_dir)}/{log} 2>/dev/null || echo '(no log yet)'").stdout)
 
 
 def stop(vm: VM, name: str) -> None:
-    ssh(vm, f"tmux kill-session -t {shlex.quote(name)} 2>/dev/null || true", check=False)
+    ssh(vm, f"tmux kill-session -t {_target(name)} 2>/dev/null || true", check=False)
     logger.info(f"[{vm.host}] stopped {name!r}")
 
 
@@ -335,12 +489,44 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--force", action="store_true", help="launch even if the GPU is in use")
     run.add_argument("sweep_args", nargs=argparse.REMAINDER, help="after `--`, passed to swo.sweep")
 
+    serve_parser = subparsers.add_parser("serve", help="start the vLLM OpenAI server and wait until it is healthy")
+    serve_parser.add_argument("--model", required=True, help="HF repo to serve, e.g. Qwen/Qwen3.5-4B")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    serve_parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=DEFAULT_GPU_MEMORY_UTILIZATION,
+        help="fraction of each card vLLM reserves up front, held for the server's whole life",
+    )
+    serve_parser.add_argument(
+        "--tensor-parallel-size", type=int, default=1, help="set to the GPU count to shard a model"
+    )
+    serve_parser.add_argument("--gpus", default=None, help="override CUDA_VISIBLE_DEVICES, e.g. '0,1'")
+    serve_parser.add_argument(
+        "--min-pixels", type=int, default=256, help="server-side floor; keep below the smallest budget"
+    )
+    serve_parser.add_argument(
+        "--max-pixels", type=int, default=16_777_216, help="server-side cap; keep above the largest budget"
+    )
+    serve_parser.add_argument("--max-model-len", type=int, default=None)
+    serve_parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="let the model emit reasoning; off by default because it burns the token budget",
+    )
+    serve_parser.add_argument("--extra", default="", help="extra flags appended to `vllm serve`")
+    serve_parser.add_argument("--timeout", type=int, default=1800, help="seconds to wait for /health")
+    serve_parser.add_argument("--skip-deploy", action="store_true", help="do not upload/sync first")
+
+    subparsers.add_parser("serve-stop", help="stop the vLLM server")
     subparsers.add_parser("check", help="show GPU, session and disk state")
     subparsers.add_parser("status", help="is it running, and how far along")
     subparsers.add_parser("fetch", help="pull results (safe mid-run)")
-    subparsers.add_parser("stop", help="kill the tmux session")
+    subparsers.add_parser("stop", help="kill the sweep's tmux session")
     log_parser = subparsers.add_parser("logs", help="tail the remote run log")
     log_parser.add_argument("--tail", type=int, default=60)
+    log_parser.add_argument("--server", action="store_true", help="tail the vLLM server log instead")
+    log_parser.add_argument("--setup", action="store_true", help="tail the dependency-sync log instead")
 
     args = parser.parse_args(argv)
     vm = resolve_vm(args.vm)
@@ -353,9 +539,32 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "fetch":
         fetch(vm)
     elif args.command == "logs":
-        logs(vm, args.tail)
+        logs(vm, args.tail, "setup.log" if args.setup else "server.log" if args.server else "run.log")
     elif args.command == "stop":
         stop(vm, args.name)
+    elif args.command == "serve-stop":
+        stop_server(vm)
+    elif args.command == "serve":
+        if not args.skip_deploy:
+            deploy(vm, extras=("vllm",))
+        base_url = serve(
+            vm,
+            args.model,
+            port=args.port,
+            timeout_s=args.timeout,
+            gpus=args.gpus,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            max_model_len=args.max_model_len,
+            enable_thinking=args.enable_thinking,
+            extra=args.extra,
+        )
+        backend_args = json.dumps(
+            {"model_version": args.model, "base_url": base_url, "api_key": "EMPTY", "system_prompt": MCQ_SYSTEM_PROMPT}
+        )
+        logger.info(f"run sweeps against it with:\n  --backend async_openai --backend-args '{backend_args}'")
     elif args.command == "run":
         sweep_args = [arg for arg in args.sweep_args if arg != "--"]
         if not sweep_args:
