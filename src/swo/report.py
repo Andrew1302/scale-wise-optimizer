@@ -50,28 +50,48 @@ def _budget_row(group: pd.DataFrame) -> pd.Series:
     return pd.Series(row)
 
 
-def _accuracy(group: pd.DataFrame) -> float | None:
-    """Fraction correct, from the ``<metric>.pred`` / ``<metric>.answer`` pair.
+#: What tasks call the prediction they scored, most specific first. seedbench_2_plus
+#: emits ``.pred``; mmmu_pro runs its own parser and emits ``.parsed_pred``.
+PRED_SUFFIXES = (".parsed_pred", ".pred")
 
-    Prefers the task's ``_all`` metric when present, since per-subject metrics
-    cover only part of the documents.
+
+def prediction_column(frame: pd.DataFrame, metric: str) -> str | None:
+    """The column holding ``metric``'s prediction, whatever the task named it."""
+    return next((f"{metric}{suffix}" for suffix in PRED_SUFFIXES if f"{metric}{suffix}" in frame.columns), None)
+
+
+def metric_names(frame: pd.DataFrame) -> list[str]:
+    """Metrics carrying a prediction/answer pair, i.e. the scorable ones."""
+    candidates = [column[: -len(".answer")] for column in frame.columns if column.endswith(".answer")]
+    return [name for name in candidates if prediction_column(frame, name)]
+
+
+def overall_metric(frame: pd.DataFrame) -> str | None:
+    """The task-wide metric, preferred over per-subject ones that cover a subset."""
+    names = metric_names(frame)
+    return next((name for name in names if name.endswith("_all")), names[0] if names else None)
+
+
+def correctness(frame: pd.DataFrame, metric: str) -> pd.Series:
+    """Per-row correctness for one metric: True, False, or NA where not scored.
+
+    Null-checked before any string coercion — pandas does not render missing
+    values as the literal ``"nan"``, so a string comparison would let them
+    through, and an unanswered document must count as wrong rather than match.
     """
-    pairs = [column[: -len(".pred")] for column in group.columns if column.endswith(".pred")]
-    pairs = [name for name in pairs if f"{name}.answer" in group.columns]
-    if not pairs:
-        return None
-    metric = next((name for name in pairs if name.endswith("_all")), pairs[0])
-
-    # Null-checked before any string coercion: pandas does not render missing
-    # values as the literal "nan", so a string comparison would let them through
-    # — and an unanswered document must count as wrong, not as a match.
-    expected_raw = group[f"{metric}.answer"]
-    if not expected_raw.notna().any():
-        return None
-    predicted = group[f"{metric}.pred"].where(group[f"{metric}.pred"].notna(), "").astype(str).str.strip().str.lower()
+    expected_raw = frame[f"{metric}.answer"]
+    predicted_raw = frame[prediction_column(frame, metric)]
+    predicted = predicted_raw.where(predicted_raw.notna(), "").astype(str).str.strip().str.lower()
     expected = expected_raw.astype(str).str.strip().str.lower()
-    scored = expected_raw.notna()
-    return (predicted[scored] == expected[scored]).mean()
+    return (predicted == expected).where(expected_raw.notna())
+
+
+def _accuracy(group: pd.DataFrame) -> float | None:
+    """Fraction correct over the documents this metric actually scores."""
+    metric = overall_metric(group)
+    if metric is None or not group[f"{metric}.answer"].notna().any():
+        return None
+    return correctness(group, metric).mean()
 
 
 def main(argv: list[str] | None = None) -> None:

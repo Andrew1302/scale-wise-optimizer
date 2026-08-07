@@ -165,6 +165,22 @@ Which token counts exist depends on the backend — local HF backends report
 `output_tokens` only, while API-style ones (`openai`, `async_openai`, `gemini`,
 `async_hf_model`) also report `input_tokens`, which is where vision tokens live.
 
+### Feeding the clustering stage
+
+```bash
+python -m swo.workbook benchmarks/seedbench_2_plus/<model>
+```
+
+Writes `resolution_analysis.xlsx` in the legacy layout — `Consolidated_Scores`
+(one row per document, one 0/1 column per budget), `Aggregated_Scores` (accuracy
+per budget per subject), and one `Resolution_<budget>` sheet each — so the
+existing clustering notebooks consume a fresh sweep with no changes. The prompt
+column is joined from `test_questions.jsonl` when present, since the sweep itself
+records pixels and answers rather than prompt text.
+
+`samples.csv` remains the richer source (tokens, latency, `sent_px`); the
+workbook exists for compatibility with what the notebooks already read.
+
 ### Pixel budgets vs. the model's own floor
 
 A budget only binds if the backend's `min_pixels` is below it. Worked example for
@@ -233,6 +249,36 @@ scored by `pred[0]` can do this. **Check the compliance rate on 10 samples befor
 starting any sweep with a new model**, and adjust the system prompt if it is not
 ~100%. Note that `system_prompt` is a per-backend argument: the qwen/HF backends
 accept it, others may not.
+
+### Check `max_new_tokens` against how the model actually answers
+
+A task's `generation_kwargs.max_new_tokens` is tuned for a model that answers
+directly. A model that reasons first gets **cut off mid-thought**, and the answer
+parser then scores whatever it can salvage — at chance.
+
+Measured on `mmmu_pro_standard` (10 options, chance = 0.10), Qwen3.5-4B at the
+task's default `max_new_tokens: 256`:
+
+- output length is **bimodal**: median 2 tokens, but 34% run to the cap
+- accuracy on truncated answers **0.121** — chance — versus **0.407** untruncated
+- overall 0.311, i.e. the cap costs ~10 accuracy points
+
+Raising it to 2048 (`--gen-kwargs max_new_tokens=2048`) recovered **+7 points**
+on a fixed 200-document sample (0.385 → 0.455). 4096 added only +0.5 more for
+1.7× the tokens, so 2048 is the knee.
+
+Two findings worth keeping:
+
+- **The system prompt still helps.** Dropping it did *not* fix truncation — it
+  scored 0.380 (baseline) while emitting 1.6× the tokens. Terse-when-possible plus
+  room-to-reason-when-needed beats either alone.
+- **Truncation was roughly flat across budgets (~34%)**, so it taxed accuracy
+  uniformly rather than bending the curve. The *shape* of a truncated sweep is
+  still informative; its *range* is compressed (+12.7 points vs +20 untruncated).
+
+Diagnose it from `samples.csv`: if `mean_output_tokens` sits at the task's
+`max_new_tokens`, the model is being cut off. On seedbench_2_plus the same check
+reads 2.0 against a cap of 16 — healthy.
 
 ### Three things that silently corrupt a sweep
 

@@ -264,12 +264,17 @@ def _is_scalar(value: Any) -> bool:
     return value is None or isinstance(value, (bool, int, float, str))
 
 
+#: How each backend family names the weights it loads. Served backends use
+#: `model_version`, so without it a vLLM run would be labelled "async_openai".
+_MODEL_KEYS = ("model", "pretrained", "model_version")
+
+
 def _model_label(backend: str | lmms, backend_args: dict | None) -> str:
     """Identify the VLM behind a run, so results are never anonymous."""
     if isinstance(backend, lmms):
         return type(backend).__name__
     args = backend_args or {}
-    return str(args.get("model") or args.get("pretrained") or backend)
+    return str(next((args[key] for key in _MODEL_KEYS if args.get(key)), backend))
 
 
 def _slug(label: str) -> str:

@@ -61,8 +61,27 @@ Three traps when serving:
   `--gpu-memory-utilization` (default 0.9) is the knob; drop it on a busy box.
   `--tensor-parallel-size N` + `--gpus 0,1` shards a model across cards.
 
-**Always `serve-stop` when you are done on a shared machine** — an idle server
-sits on the card indefinitely. `check` and `status` both report whether one is up.
+**Pass `--stop-server` to `run`.** It arms a watchdog *on the VM* that kills the
+server the moment the sweep's tmux session ends — so a killed local process, a
+dropped connection, or a closed laptop can never strand a server on a shared card.
+Use it on every long run; it costs nothing and removes the whole failure mode.
+
+**`serve-stop` the moment a run finishes — not when the conversation does.**
+An idle server holds ~27 GB indefinitely at 0% utilisation, and these machines are
+shared (c2d is borrowed). Bringing it back costs ~90 s, so there is never a reason
+to keep a card reserved while waiting on a decision, reading results, or asking a
+question. `check` and `status` both report whether a server is up; verify with:
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+```
+
+and check the owner of anything still listed — a colleague's job looks identical
+to yours in the memory column.
+
+**Default to one card.** Use `--data-parallel-size 2 --gpus 0,1` only when the
+box is genuinely idle and the run is long enough to justify taking the whole
+machine; drop back to one card for tests and probes.
 
 `--vm vm03|vm02|c2d` (default `vm03`) goes **before** the subcommand.
 Everything after `--` is passed verbatim to `swo.sweep`, so any sweep flag works
@@ -99,6 +118,22 @@ so it biases the resolution curve in the direction that matters.
 - `"system_prompt": "You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."`
   — takes compliance from 51% to **100%** and cuts output to 2 tokens. The task's
   own `post_prompt` is not sufficient.
+
+### The other half: is the model being cut off?
+
+A reasoning model on a hard task blows through the task's `max_new_tokens` and is
+scored on a truncated thought — at chance. Check `mean_output_tokens` in the
+report against the task's cap:
+
+| reads | meaning |
+|---|---|
+| ≈ the task's `max_new_tokens` | being truncated — raise it with `--gen-kwargs max_new_tokens=2048` |
+| small (2–3) | answering directly; the cap is fine |
+
+Measured on `mmmu_pro_standard`: at the default 256, 34% of answers truncated and
+scored 0.121 (chance is 0.10) versus 0.407 untruncated. `max_new_tokens=2048`
+recovered +7 points; 4096 added only +0.5, so 2048 is the knee. Keep the system
+prompt — dropping it did not help and cost 1.6× the tokens.
 
 **Always smoke-test compliance on 10 samples with a new model** before committing
 GPU hours:

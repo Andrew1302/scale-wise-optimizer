@@ -205,6 +205,9 @@ def test_append_csv_rejects_a_new_column_rather_than_shifting_rows(tmp_path):
     [
         ("vllm", {"model": "Qwen/Qwen3-VL-8B"}, "Qwen/Qwen3-VL-8B"),
         ("hf", {"pretrained": "org/name"}, "org/name"),
+        # Served backends name the weights differently; missing this labelled a
+        # whole vLLM sweep "async_openai" instead of the model it ran.
+        ("async_openai", {"model_version": "Qwen/Qwen3.5-4B", "base_url": "http://x"}, "Qwen/Qwen3.5-4B"),
         ("vllm", None, "vllm"),
     ],
 )

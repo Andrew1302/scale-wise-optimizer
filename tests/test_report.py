@@ -89,6 +89,18 @@ def test_an_empty_response_counts_as_wrong_not_as_missing(tmp_path):
     assert build_report(tmp_path)["accuracy"].iloc[0] == 0.5
 
 
+def test_tasks_that_parse_their_own_prediction_are_scored(tmp_path):
+    """mmmu_pro runs its own answer parser and emits `.parsed_pred`, not `.pred`."""
+    pd.DataFrame(
+        [
+            {"budget": 2_000, "doc_id": 0, "mmmu_acc.parsed_pred": "H", "mmmu_acc.answer": "H"},
+            {"budget": 2_000, "doc_id": 1, "mmmu_acc.parsed_pred": "A", "mmmu_acc.answer": "B"},
+        ]
+    ).to_csv(tmp_path / "samples.csv", index=False)
+
+    assert build_report(tmp_path)["accuracy"].iloc[0] == 0.5
+
+
 def test_report_without_a_metric_pair_still_describes_the_run(tmp_path):
     pd.DataFrame([{"budget": 2_000, "doc_id": 0, "sent_px": 1_936}]).to_csv(tmp_path / "samples.csv", index=False)
 

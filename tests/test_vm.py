@@ -95,6 +95,18 @@ def test_tensor_parallel_lets_a_model_span_cards():
     assert "--tensor-parallel-size 2" in serve_command("m", tensor_parallel_size=2)
 
 
+def test_data_parallel_runs_a_replica_per_card():
+    """The right way to use a second GPU when the model already fits on one."""
+    assert "--data-parallel-size 2" in serve_command("m", data_parallel_size=2)
+
+
+def test_a_single_card_is_the_default():
+    command = serve_command("m")
+
+    assert "--tensor-parallel-size 1" in command
+    assert "--data-parallel-size 1" in command
+
+
 @pytest.mark.parametrize(
     ("kwargs", "absent"),
     [({}, "--max-model-len"), ({"extra": ""}, "--extra")],
@@ -109,8 +121,13 @@ def test_model_names_are_quoted():
 
 def test_system_prompt_is_the_one_validated_for_compliance():
     """Shared with the README/skill recipe; changing it changes measured accuracy."""
-    assert "exactly one character" in MCQ_SYSTEM_PROMPT
-    assert "Do not explain" in MCQ_SYSTEM_PROMPT
+    assert "only the letter" in MCQ_SYSTEM_PROMPT
+    assert "nothing else" in MCQ_SYSTEM_PROMPT
+
+
+def test_system_prompt_does_not_assume_four_options():
+    """seedbench_2_plus has four choices, mmmu_pro_standard has ten."""
+    assert "A, B, C, or D" not in MCQ_SYSTEM_PROMPT
 
 
 def test_server_session_is_separate_from_the_sweep_session():
@@ -131,6 +148,21 @@ def test_the_sweep_session_never_resolves_the_server(monkeypatch):
     vm_module.session_alive(VMS["vm03"], "swo")
 
     assert "=swo" in asked[0], "a prefix target would also match swo_vllm"
+
+
+def test_watchdog_waits_on_the_sweep_then_kills_the_server():
+    """Runs on the VM, so a dead laptop cannot strand a server holding a GPU."""
+    command = vm_module.watchdog_command("swo")
+
+    assert "has-session -t =swo " in command, "must match the sweep exactly, not by prefix"
+    assert f"kill-session -t ={SERVER_SESSION}" in command
+
+
+def test_watchdog_targets_are_exact():
+    """A prefix target would let the watchdog match — and kill — the wrong session."""
+    command = vm_module.watchdog_command("swo")
+
+    assert "-t swo " not in command and f"-t {SERVER_SESSION}" not in command
 
 
 def test_deploy_never_prunes_another_step_s_packages(monkeypatch):

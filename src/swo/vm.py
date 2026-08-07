@@ -52,16 +52,21 @@ SERVER_SESSION = "swo_vllm"
 #: Dependency sync runs in tmux too: installing vllm pulls ~10 GB of CUDA wheels,
 #: and a foreground ssh command dies with the connection.
 SETUP_SESSION = "swo_setup"
+
+#: Watches a sweep and stops the server when it ends. Lives on the VM so that a
+#: disconnected laptop can never strand a server holding a card on a shared box.
+WATCHDOG_SESSION = "swo_watch"
 DEFAULT_PORT = 8000
 
 #: vLLM pre-allocates this fraction of the card up front. Whoever holds it holds it
 #: for the server's whole life, so it is a deliberate, visible knob.
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 
-#: Without this, chatty models lead with prose and are scored wrong — the task is
-#: graded on the response's first character. See the README on compliance.
+#: Without this, chatty models lead with prose and are scored wrong on tasks graded
+#: from the response's first character. Deliberately option-count agnostic —
+#: seedbench_2_plus offers four choices, mmmu_pro_standard ten. See the README.
 MCQ_SYSTEM_PROMPT = (
-    "You are answering a multiple-choice question. Reply with exactly one character: A, B, C, or D. Do not explain."
+    "You are answering a multiple-choice question. Reply with only the letter of the correct option, and nothing else."
 )
 
 
@@ -329,6 +334,7 @@ def serve_command(
     port: int = DEFAULT_PORT,
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
     tensor_parallel_size: int = 1,
+    data_parallel_size: int = 1,
     min_pixels: int = 256,
     max_pixels: int = 16_777_216,
     max_model_len: int | None = None,
@@ -356,6 +362,9 @@ def serve_command(
         f"--port {int(port)}",
         f"--gpu-memory-utilization {float(gpu_memory_utilization)}",
         f"--tensor-parallel-size {int(tensor_parallel_size)}",
+        # Replicas, not shards. A model that fits on one card gains throughput
+        # from another replica; tensor-parallel would only add sharding overhead.
+        f"--data-parallel-size {int(data_parallel_size)}",
         f"--mm-processor-kwargs {shlex.quote(processor_kwargs)}",
         f"--default-chat-template-kwargs {shlex.quote(template_kwargs)}",
     ]
@@ -401,6 +410,28 @@ def serve(
             raise SystemExit(f"vLLM exited during startup — `swo.vm serve-logs --vm {vm_name(vm)}`")
         time.sleep(10)
     raise SystemExit(f"vLLM did not answer /health within {timeout_s}s — check `serve-logs`")
+
+
+def watchdog_command(sweep_session: str, poll_s: int = 30) -> str:
+    """Shell that waits for the sweep to end, then kills the server."""
+    return (
+        f"while tmux has-session -t ={sweep_session} 2>/dev/null; do sleep {int(poll_s)}; done; "
+        f"tmux kill-session -t ={SERVER_SESSION} 2>/dev/null"
+    )
+
+
+def watch_and_stop_server(vm: VM, sweep_session: str) -> None:
+    """Arrange for the server to be stopped as soon as the sweep finishes.
+
+    Runs on the VM, so a killed local process — or a closed laptop — cannot leave
+    a server holding a GPU on a shared machine.
+    """
+    ssh(vm, f"tmux kill-session -t {_target(WATCHDOG_SESSION)} 2>/dev/null || true", check=False)
+    command = shlex.quote(watchdog_command(sweep_session))
+    ssh(vm, f"tmux new-session -d -s {shlex.quote(WATCHDOG_SESSION)} {command}")
+    if not session_alive(vm, WATCHDOG_SESSION):
+        raise SystemExit("watchdog did not start — stop the server yourself when the sweep ends")
+    logger.info(f"[{vm.host}] watchdog armed: server stops when {sweep_session!r} ends")
 
 
 def stop_server(vm: VM) -> None:
@@ -487,6 +518,11 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--poll", type=int, default=60, help="seconds between liveness checks")
     run.add_argument("--detach", action="store_true", help="return once tmux is up instead of waiting")
     run.add_argument("--force", action="store_true", help="launch even if the GPU is in use")
+    run.add_argument(
+        "--stop-server",
+        action="store_true",
+        help="stop the vLLM server when the sweep ends, via a watchdog on the VM",
+    )
     run.add_argument("sweep_args", nargs=argparse.REMAINDER, help="after `--`, passed to swo.sweep")
 
     serve_parser = subparsers.add_parser("serve", help="start the vLLM OpenAI server and wait until it is healthy")
@@ -498,8 +534,12 @@ def main(argv: list[str] | None = None) -> None:
         default=DEFAULT_GPU_MEMORY_UTILIZATION,
         help="fraction of each card vLLM reserves up front, held for the server's whole life",
     )
+    serve_parser.add_argument("--tensor-parallel-size", type=int, default=1, help="shard one model across N cards")
     serve_parser.add_argument(
-        "--tensor-parallel-size", type=int, default=1, help="set to the GPU count to shard a model"
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="run N replicas, one per card — better than sharding when the model fits on one GPU",
     )
     serve_parser.add_argument("--gpus", default=None, help="override CUDA_VISIBLE_DEVICES, e.g. '0,1'")
     serve_parser.add_argument(
@@ -555,6 +595,7 @@ def main(argv: list[str] | None = None) -> None:
             gpus=args.gpus,
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
+            data_parallel_size=args.data_parallel_size,
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             max_model_len=args.max_model_len,
@@ -576,6 +617,8 @@ def main(argv: list[str] | None = None) -> None:
             logger.warning(message)
         deploy(vm)
         launch(vm, args.name, sweep_args)
+        if args.stop_server:
+            watch_and_stop_server(vm, args.name)
         if args.detach:
             logger.info("detached. `status` to check, `fetch` when done.")
             return
