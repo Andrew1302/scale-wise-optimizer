@@ -143,18 +143,32 @@ flickering around zero.""",
     ),
     (
         "code",
-        """fig, axes = plt.subplots(1, len(RUNS), figsize=(6 * len(RUNS), 4), squeeze=False)
+        """# Shared styling for every strategy chart: colours, markers, display names and
+# legend order (Fixed budget, BPC, E99, E95) stay identical across sections 3-5.
+STYLE = {
+    "best": ("*", "#2ecc71", 280),
+    "efficient_99": ("s", "#e74c3c", 180),
+    "efficient_95": ("D", "#e67e22", 180),
+}
+NAMES = {"best": "BPC", "efficient_99": "E99", "efficient_95": "E95"}
+SHORT_RES = {"2000": "2k", "12500": "12.5k", "25000": "25k", "50000": "50k",
+             "100000": "100k", "150000": "150k", "250000": "250k",
+             "400000": "400k", "600000": "600k", "800000": "800k"}
+COST_LABEL = COST.replace("_", " ")
+
+fig, axes = plt.subplots(1, len(RUNS), figsize=(6 * len(RUNS), 4), squeeze=False)
 for ax, label in zip(axes[0], RUNS, strict=True):
     table = lifts[label]
-    for strategy, group in table.groupby("strategy"):
-        ax.plot(group["k"], group["lift"], marker="o", label=strategy)
+    for name, (marker, colour, _) in STYLE.items():
+        group = table[table["strategy"] == name]
+        ax.plot(group["k"], group["lift"], marker=marker, ms=7, color=colour, label=NAMES[name])
     ax.axhline(0, color="black", lw=1)
     ax.set_title(label)
     ax.set_xlabel("clusters (K)")
-    ax.set_ylabel(f"lift vs fixed budget at equal {COST}")
-    ax.legend()
+    ax.set_ylabel(f"Lift vs fixed budget at equal {COST_LABEL}")
+    ax.legend(fontsize=11)
 plt.tight_layout()
-plt.savefig(RESULTS_DIR / "kfold_lift_vs_k.pdf")
+fig.savefig(RESULTS_DIR / "kfold_lift_vs_k.pdf", bbox_inches="tight")
 plt.show()""",
     ),
     (
@@ -168,20 +182,51 @@ expensive point.""",
     ),
     (
         "code",
-        """fig, axes = plt.subplots(1, len(RUNS), figsize=(6 * len(RUNS), 4), squeeze=False)
-for ax, label in zip(axes[0], RUNS, strict=True):
+        """# Axis limits per (benchmark, cost basis), shared with the section 5 charts so
+# figures of the same benchmark and axis stay directly comparable.
+SHARED_LIMITS = {}
+
+for label in RUNS:
     curve = fixed_frontier(folds[label])
-    ax.plot(curve["cost"], curve["accuracy"], marker="s", color="black", label="fixed budget")
+    full_cost = curve["cost"].max()
     table = lifts[label]
-    for strategy, group in table.groupby("strategy"):
-        ax.scatter(group["cost"], group["accuracy"], label=strategy, alpha=0.8)
-    ax.set_title(label)
-    ax.set_xlabel(f"mean {COST} per document")
-    ax.set_ylabel("out-of-fold accuracy")
-    ax.legend()
-plt.tight_layout()
-plt.savefig(RESULTS_DIR / "kfold_accuracy_vs_cost.pdf")
-plt.show()""",
+    for basis in ("tokens", "relative"):
+        if basis == "tokens":
+            curve_x = curve["cost"]
+            xlabel = f"Mean {COST_LABEL} per document"
+        else:
+            curve_x = curve["cost"] / full_cost * 100
+            xlabel = f"Relative computational cost (% of full-resolution {COST_LABEL})"
+        routed_x = table["cost"] if basis == "tokens" else table["cost_share"] * 100
+        xs = pd.concat([curve_x, routed_x])
+        ys = pd.concat([curve["accuracy"], table["accuracy"]])
+        x_pad, y_pad = 0.05 * (xs.max() - xs.min()), 0.14 * (ys.max() - ys.min())
+        xlim = (xs.min() - x_pad, xs.max() + x_pad)
+        ylim = (ys.min() - y_pad, ys.max() + y_pad)
+        SHARED_LIMITS[(label, basis)] = (xlim, ylim)
+
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.plot(curve_x, curve["accuracy"], "o-", color="#3498db", label="Fixed budget", zorder=3)
+        for _, row in curve.iterrows():
+            x = row["cost"] if basis == "tokens" else row["cost"] / full_cost * 100
+            ax.annotate(SHORT_RES[str(int(row["budget"]))], (x, row["accuracy"]),
+                        textcoords="offset points", xytext=(0, 6),
+                        ha="center", fontsize=9, color="#2c3e50")
+        for name, (marker, colour, _) in STYLE.items():
+            group = table[table["strategy"] == name]
+            group_x = group["cost"] if basis == "tokens" else group["cost_share"] * 100
+            ax.scatter(group_x, group["accuracy"], marker=marker, c=colour, s=70,
+                       alpha=0.8, edgecolors="black", linewidth=0.5, label=NAMES[name], zorder=4)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Out-of-fold accuracy")
+        ax.legend(loc="lower right", fontsize=11)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        suffix = "_tokens" if basis == "tokens" else ""
+        fig.savefig(RESULTS_DIR / f"kfold_accuracy_vs_cost_all_k_{label}{suffix}.pdf", bbox_inches="tight")
+        plt.show()""",
     ),
     (
         "markdown",
@@ -208,48 +253,68 @@ pd.concat(summaries.values(), ignore_index=True).to_csv(RESULTS_DIR / "kfold_str
     ),
     (
         "code",
-        """STYLE = {
-    "best": ("*", "#2ecc71", 280),
-    "efficient_95": ("D", "#e67e22", 180),
-    "efficient_99": ("s", "#e74c3c", 180),
-}
+        """# One frame per distinct point (coincident strategies share a frame), placed
+# just below its point; the horizontal split keeps near-coincident points apart
+FRAME_OFFSETS = [(-70, -46), (70, -46), (0, -100)]
 
 for label in RUNS:
     table = summaries[label]
-    fig, ax = plt.subplots(figsize=(12, 7))
+    for basis in ("tokens", "relative"):
+        xcol, xsd = ("cost", "cost_sd") if basis == "tokens" else ("cost_pct", "cost_pct_sd")
+        fig, ax = plt.subplots(figsize=(12, 7))
 
-    fixed = table[table["is_fixed"]]
-    ax.errorbar(fixed["cost_pct"], fixed["accuracy"], yerr=fixed["accuracy_sd"],
-                fmt="o-", color="#3498db", lw=2, ms=8, capsize=3,
-                label="Fixed budget", zorder=3)
-    for _, row in fixed.iterrows():
-        ax.annotate(row["strategy"].replace("fixed_", ""), (row["cost_pct"], row["accuracy"]),
-                    textcoords="offset points", xytext=(0, 10), ha="center",
-                    fontsize=7, color="#2c3e50")
+        # Same axis limits as the section 4 chart of this benchmark and basis
+        xlim, ylim = SHARED_LIMITS[(label, basis)]
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        y0, y1 = ylim
 
-    for offset, (_, row) in enumerate(table[~table["is_fixed"]].iterrows()):
-        marker, colour, size = STYLE[row["strategy"]]
-        ax.errorbar(row["cost_pct"], row["accuracy"],
-                    xerr=row["cost_pct_sd"], yerr=row["accuracy_sd"],
-                    fmt="none", ecolor=colour, capsize=3, zorder=4)
-        ax.scatter(row["cost_pct"], row["accuracy"], marker=marker, c=colour, s=size,
-                   zorder=5, edgecolors="black", linewidth=0.8, label=row["strategy"])
-        ax.annotate(
-            f"{row['strategy']}\\n({row['cost_pct']:.1f}% cost, {row['accuracy']:.4f} ± {row['accuracy_sd']:.4f})",
-            (row["cost_pct"], row["accuracy"]),
-            textcoords="offset points", xytext=(18, (-22, 16, -6)[offset % 3]),
-            fontsize=9, fontweight="bold", color=colour,
-            arrowprops=dict(arrowstyle="->", color=colour, lw=1.3),
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=colour, alpha=0.9))
+        fixed = table[table["is_fixed"]]
+        ax.errorbar(fixed[xcol], fixed["accuracy"], yerr=fixed["accuracy_sd"],
+                    fmt="o-", color="#3498db", lw=2, ms=8, capsize=3,
+                    label="Fixed budget", zorder=3)
 
-    ax.set_xlabel(f"Relative computational cost (% of full-resolution {COST})", fontsize=11)
-    ax.set_ylabel("Out-of-fold accuracy", fontsize=11)
-    ax.set_title(f"{label} — {N_FOLDS}-fold CV, K={SUMMARY_K}: accuracy vs cost (mean ± std)", fontsize=13)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig.savefig(RESULTS_DIR / f"kfold_accuracy_vs_cost_{label}.pdf", bbox_inches="tight")
-    plt.show()""",
+        # Labels sit just past the error bar so label and bar never collide
+        ax_h_pts = fig.get_size_inches()[1] * 72 * 0.78
+        for _, row in fixed.iterrows():
+            err_pts = row["accuracy_sd"] / (y1 - y0) * ax_h_pts
+            ax.annotate(SHORT_RES[row["strategy"].replace("fixed_", "")],
+                        (row[xcol], row["accuracy"]),
+                        textcoords="offset points", xytext=(0, 6 + err_pts), ha="center",
+                        fontsize=9, color="#2c3e50")
+
+        groups = {}
+        for name, (marker, colour, size) in STYLE.items():
+            row = table[table["strategy"] == name].iloc[0]
+            ax.errorbar(row[xcol], row["accuracy"],
+                        xerr=row[xsd], yerr=row["accuracy_sd"],
+                        fmt="none", ecolor=colour, capsize=3, zorder=4)
+            ax.scatter(row[xcol], row["accuracy"], marker=marker, c=colour, s=size,
+                       zorder=5, edgecolors="black", linewidth=0.8, label=NAMES[name])
+            key = (round(row[xcol], 3), round(row["accuracy"], 3))
+            groups.setdefault(key, ([], row["accuracy_sd"]))[0].append(name)
+
+        for offset, ((cost, acc), (names, acc_sd)) in zip(FRAME_OFFSETS, sorted(groups.items())):
+            colour = STYLE[names[0]][1]
+            cost_text = f"{cost:.1f}% cost" if basis == "relative" else f"{cost:.0f} {COST_LABEL}"
+            ax.annotate(
+                " = ".join(NAMES[n] for n in names) + f"\\n({cost_text}, {acc:.4f} ± {acc_sd:.4f})",
+                xy=(cost, acc), xycoords="data",
+                xytext=offset, textcoords="offset points",
+                ha="center", va="top", fontsize=9, fontweight="bold", color=colour,
+                arrowprops=dict(arrowstyle="->", color=colour, lw=1.3, shrinkB=10),
+                bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=colour, alpha=0.95))
+
+        xlabel = (f"Relative computational cost (% of full-resolution {COST_LABEL})"
+                  if basis == "relative" else f"Mean {COST_LABEL} per document")
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel("Out-of-fold accuracy", fontsize=11)
+        ax.legend(loc="lower right", fontsize=11, markerscale=0.6, labelspacing=0.7, borderpad=0.8)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        suffix = "_tokens" if basis == "tokens" else ""
+        fig.savefig(RESULTS_DIR / f"kfold_accuracy_vs_cost_{label}{suffix}.pdf", bbox_inches="tight")
+        plt.show()""",
     ),
     (
         "markdown",
