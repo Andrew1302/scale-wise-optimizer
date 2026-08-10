@@ -32,6 +32,7 @@ class Sweep:
     costs: np.ndarray
     subjects: np.ndarray
     cost_name: str
+    native_px: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         expected = (len(self.doc_ids), len(self.budgets))
@@ -41,6 +42,18 @@ class Sweep:
     @property
     def n_documents(self) -> int:
         return len(self.doc_ids)
+
+    def effective_budget(self, budget: int) -> int:
+        """What ``budget`` actually caps at, given the images this sweep ran on.
+
+        A budget above every image's native size is a no-op — the pipeline never
+        upscales — so naming such a rung after its nominal budget overstates it.
+        seedbench is uniformly 800x800, which makes its 800,000 rung identical to
+        640,000. Falls back to the nominal budget when no native sizes are known.
+        """
+        if self.native_px is None:
+            return int(budget)
+        return min(int(budget), int(self.native_px.max()))
 
     def accuracy_at(self, budget_index: np.ndarray) -> float:
         """Mean accuracy when each document is run at its own budget index."""
@@ -72,6 +85,13 @@ def load_sweep(run_dir: Path, cost: str = "input_tokens") -> Sweep:
     complete = scores.notna().all(axis=1) & costs.notna().all(axis=1)
     scores, costs = scores[complete].reindex(columns=budgets), costs[complete].reindex(columns=budgets)
 
+    # Constant across budgets — the source image never changes — so any of a
+    # document's rows will do. Absent from sweeps predating the pixel columns.
+    native = None
+    if "original_px" in samples.columns:
+        per_doc = samples.drop_duplicates("doc_id").set_index("doc_id")["original_px"]
+        native = per_doc.reindex(scores.index).to_numpy(dtype=float)
+
     return Sweep(
         task=str(samples["task"].iloc[0]),
         doc_ids=scores.index.to_numpy(),
@@ -80,6 +100,7 @@ def load_sweep(run_dir: Path, cost: str = "input_tokens") -> Sweep:
         costs=costs.to_numpy(dtype=float),
         subjects=_subjects(samples, metric, scores.index),
         cost_name=cost,
+        native_px=native,
     )
 
 

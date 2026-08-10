@@ -49,12 +49,19 @@ K_VALUES = [2, 3, 5, 8, 12, 20, 30, 50]
 N_FOLDS = 5
 RANDOM_STATE = 42
 
-# K used for the single-K strategy comparison chart (section 5); must be in K_VALUES.
+# K used for the heatmap and the strategy comparison chart; must be in K_VALUES.
 SUMMARY_K = 30
 
-# ── Cost basis. input_tokens is what the model actually pays for; sent_px is
-#    what the pipeline controls. Both are recorded per document per budget. ─────
-COST = "input_tokens"
+# Fold whose training rows the heatmap shows. Same split as the evaluation.
+HEATMAP_FOLD = 0
+
+# ── Cost basis. sent_px is what the pipeline controls, and the basis the paper
+#    reports: cost is stated relative to the *native* image, so 100% is the
+#    budget ladder's top rung only where that rung actually reaches native.
+#    seedbench images are uniformly 800x800, so its 100% is 640,000 px — the
+#    800,000 budget sends no more than the 640,000 one. input_tokens is the
+#    alternative basis (what the model bills); both are per document per budget.
+COST = "sent_px"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RESULTS_DIR = PROJECT_ROOT / "src/clustering/results"
@@ -83,6 +90,37 @@ for label, run_dir in RUNS.items():
         question_text(sweep.task, sweep.doc_ids), show_progress_bar=False, convert_to_numpy=True
     )
     print(f"{label}: {sweep.n_documents} documents x {len(sweep.budgets)} budgets")""",
+    ),
+    (
+        "code",
+        """# Shared styling: colours, markers, display names and legend order
+# (Fixed budget, BPC, E99, E95) stay identical across every chart.
+STYLE = {
+    "best": ("*", "#2ecc71", 280),
+    "efficient_99": ("s", "#e74c3c", 180),
+    "efficient_95": ("D", "#e67e22", 180),
+}
+NAMES = {"best": "BPC", "efficient_99": "E99", "efficient_95": "E95"}
+COST_LABEL = {"sent_px": "pixels sent", "input_tokens": "input tokens"}[COST]
+
+
+# Short name for a fixed rung, capped at what the budget can actually reach.
+# Budgets are nominal: the pipeline never upscales, so a budget above every
+# native image is a no-op and naming the rung after it overstates the cost.
+# seedbench's images are uniformly 800x800, so its 800,000 rung is really
+# 640,000 — which is also the 100% this benchmark's cost axis divides by.
+def rung(label, budget):
+    pixels = sweeps[label].effective_budget(budget)
+    return f"{pixels / 1_000:g}k" if pixels < 1_000_000 else f"{pixels / 1_000_000:g}M"
+
+
+# The denominator every cost percentage is divided by, printed so a figure
+# caption can name it rather than imply the nominal top budget.
+for label in RUNS:
+    full = sweeps[label].costs.mean(axis=0).max()
+    top = sweeps[label].budgets.max()
+    print(f"{label}: 100% = {full:,.0f} {COST_LABEL} per document "
+          f"(the {top:,} budget, which reaches {rung(label, top)} pixels)")""",
     ),
     (
         "markdown",
@@ -146,106 +184,154 @@ flickering around zero.""",
         """fig, axes = plt.subplots(1, len(RUNS), figsize=(6 * len(RUNS), 4), squeeze=False)
 for ax, label in zip(axes[0], RUNS, strict=True):
     table = lifts[label]
-    for strategy, group in table.groupby("strategy"):
-        ax.plot(group["k"], group["lift"], marker="o", label=strategy)
+    for name, (marker, colour, _) in STYLE.items():
+        group = table[table["strategy"] == name]
+        ax.plot(group["k"], group["lift"], marker=marker, ms=7, color=colour, label=NAMES[name])
     ax.axhline(0, color="black", lw=1)
     ax.set_title(label)
     ax.set_xlabel("clusters (K)")
-    ax.set_ylabel(f"lift vs fixed budget at equal {COST}")
-    ax.legend()
+    ax.set_ylabel(f"Lift vs fixed budget at equal {COST_LABEL}")
+    ax.legend(fontsize=11)
 plt.tight_layout()
-plt.savefig(RESULTS_DIR / "kfold_lift_vs_k.pdf")
+fig.savefig(RESULTS_DIR / "kfold_lift_vs_k.pdf", bbox_inches="tight")
 plt.show()""",
     ),
     (
         "markdown",
         """---
-## 4. Accuracy vs cost
+## 4. What the policy is fit on
 
-The routed strategies are plotted against the fixed frontier. A strategy is only
-interesting if it sits **above** the line, not merely to the left of the most
-expensive point.""",
+Accuracy of each cluster at each budget, on the training rows of one fold. This
+is the matrix the policy reads: `BPC` takes each row's argmax (boxed), `E95` and
+`E99` take the cheapest column within tolerance of it. Read it as a diagnostic,
+not a result — these are training rows, so the peaks are partly noise, and the
+count of clusters peaking at the top budget is what routing is betting on.""",
     ),
     (
         "code",
-        """fig, axes = plt.subplots(1, len(RUNS), figsize=(6 * len(RUNS), 4), squeeze=False)
-for ax, label in zip(axes[0], RUNS, strict=True):
-    curve = fixed_frontier(folds[label])
-    ax.plot(curve["cost"], curve["accuracy"], marker="s", color="black", label="fixed budget")
-    table = lifts[label]
-    for strategy, group in table.groupby("strategy"):
-        ax.scatter(group["cost"], group["accuracy"], label=strategy, alpha=0.8)
-    ax.set_title(label)
-    ax.set_xlabel(f"mean {COST} per document")
-    ax.set_ylabel("out-of-fold accuracy")
-    ax.legend()
-plt.tight_layout()
-plt.savefig(RESULTS_DIR / "kfold_accuracy_vs_cost.pdf")
-plt.show()""",
+        """from matplotlib.patches import Rectangle
+
+from clustering.kfold import cluster_accuracy
+
+heatmaps = {}
+for label in RUNS:
+    table = cluster_accuracy(
+        sweeps[label], embeddings[label], SUMMARY_K, HEATMAP_FOLD, N_FOLDS, RANDOM_STATE
+    )
+    heatmaps[label] = table
+    table.to_csv(RESULTS_DIR / f"cluster_accuracy_{label}.csv")
+
+    grid = table.drop(columns="n_questions")
+    fig, ax = plt.subplots(figsize=(12, max(6, SUMMARY_K * 0.34)))
+    sns.heatmap(grid, annot=True, fmt=".3f", annot_kws={"fontsize": 7}, cmap="RdYlGn",
+                center=float(grid.to_numpy().mean()), linewidths=0.5,
+                cbar_kws={"label": "Training-fold accuracy"}, ax=ax)
+    for row, (_, accuracies) in enumerate(grid.iterrows()):
+        ax.add_patch(Rectangle((int(accuracies.to_numpy().argmax()), row), 1, 1,
+                               fill=False, edgecolor="black", lw=1.8))
+    ax.set_xticklabels([rung(label, b) for b in grid.columns])
+    ax.set_xlabel("Resolution budget (pixels)")
+    ax.set_ylabel(f"Cluster (K={SUMMARY_K}, fold {HEATMAP_FOLD})")
+    ax.set_title(f"{label} — per-cluster accuracy by budget")
+    plt.tight_layout()
+    fig.savefig(RESULTS_DIR / f"cluster_accuracy_heatmap_{label}.pdf", bbox_inches="tight")
+    plt.show()
+
+    peaks = grid.to_numpy().argmax(axis=1)
+    top = (peaks == grid.shape[1] - 1).sum()
+    print(f"{label}: {top} of {SUMMARY_K} clusters peak at the top budget "
+          f"({int(grid.columns[-1]):,} px)")""",
     ),
     (
         "markdown",
         """---
 ## 5. Strategy comparison at a single K
 
-The chart the original notebook produced, rebuilt on k-fold: accuracy against
-relative cost, with error bars showing the spread across folds on **both** axes.
-The routed strategies vary in cost between folds (different clusters get
-different budgets), which the original's single split could not show.""",
+The paper figure: accuracy against relative cost at `SUMMARY_K`, with error bars
+showing the spread across folds on **both** axes. The routed strategies vary in
+cost between folds — different clusters get different budgets — which a single
+split could not show.""",
     ),
     (
         "code",
         """from clustering.kfold import strategy_summary
 
+COLUMNS = ["strategy", "accuracy", "accuracy_sd", "cost_pct", "cost_pct_sd"]
+
 summaries = {label: strategy_summary(folds[label], SUMMARY_K) for label in RUNS}
 for label, table in summaries.items():
     table.insert(0, "benchmark", label)
+    table.insert(1, "name", [NAMES[s] if s in NAMES else rung(label, int(s.replace("fixed_", "")))
+                             for s in table["strategy"]])
     print(f"── {label} ── {N_FOLDS}-fold, K={SUMMARY_K} (mean ± std across folds)")
-    print(table[["strategy", "accuracy", "accuracy_sd", "cost_pct", "cost_pct_sd"]].round(4).to_string(index=False))
+    print(table[COLUMNS].round(4).to_string(index=False))
     print()
+
+    # A paper-ready rendering of the same rows, so the numbers are never retyped.
+    (RESULTS_DIR / f"strategy_comparison_{label}.tex").write_text(
+        table[["name", "accuracy", "accuracy_sd", "cost_pct", "cost_pct_sd"]]
+        .rename(columns={"name": "Strategy", "accuracy": "Accuracy", "accuracy_sd": "Acc. SD",
+                         "cost_pct": "Cost (\\\\%)", "cost_pct_sd": "Cost SD"})
+        .to_latex(index=False, float_format="%.4f", escape=False)
+    )
 
 pd.concat(summaries.values(), ignore_index=True).to_csv(RESULTS_DIR / "kfold_strategy_comparison.csv", index=False)""",
     ),
     (
         "code",
-        """STYLE = {
-    "best": ("*", "#2ecc71", 280),
-    "efficient_95": ("D", "#e67e22", 180),
-    "efficient_99": ("s", "#e74c3c", 180),
-}
+        """# One frame per distinct point (coincident strategies share a frame), placed
+# just below its point; the horizontal split keeps near-coincident points apart
+FRAME_OFFSETS = [(-70, -46), (70, -46), (0, -100)]
 
 for label in RUNS:
     table = summaries[label]
     fig, ax = plt.subplots(figsize=(12, 7))
 
+    xs, ys = table["cost_pct"], table["accuracy"]
+    x_pad, y_pad = 0.05 * (xs.max() - xs.min()), 0.14 * (ys.max() - ys.min())
+    ax.set_xlim(xs.min() - x_pad, xs.max() + x_pad)
+    y0, y1 = ys.min() - y_pad, ys.max() + y_pad
+    ax.set_ylim(y0, y1)
+
     fixed = table[table["is_fixed"]]
     ax.errorbar(fixed["cost_pct"], fixed["accuracy"], yerr=fixed["accuracy_sd"],
                 fmt="o-", color="#3498db", lw=2, ms=8, capsize=3,
                 label="Fixed budget", zorder=3)
-    for _, row in fixed.iterrows():
-        ax.annotate(row["strategy"].replace("fixed_", ""), (row["cost_pct"], row["accuracy"]),
-                    textcoords="offset points", xytext=(0, 10), ha="center",
-                    fontsize=7, color="#2c3e50")
 
-    for offset, (_, row) in enumerate(table[~table["is_fixed"]].iterrows()):
-        marker, colour, size = STYLE[row["strategy"]]
+    # Labels sit just past the error bar so label and bar never collide
+    ax_h_pts = fig.get_size_inches()[1] * 72 * 0.78
+    for _, row in fixed.iterrows():
+        err_pts = row["accuracy_sd"] / (y1 - y0) * ax_h_pts
+        ax.annotate(rung(label, int(row["strategy"].replace("fixed_", ""))),
+                    (row["cost_pct"], row["accuracy"]),
+                    textcoords="offset points", xytext=(0, 6 + err_pts), ha="center",
+                    fontsize=9, color="#2c3e50")
+
+    groups = {}
+    for name, (marker, colour, size) in STYLE.items():
+        row = table[table["strategy"] == name].iloc[0]
         ax.errorbar(row["cost_pct"], row["accuracy"],
                     xerr=row["cost_pct_sd"], yerr=row["accuracy_sd"],
                     fmt="none", ecolor=colour, capsize=3, zorder=4)
         ax.scatter(row["cost_pct"], row["accuracy"], marker=marker, c=colour, s=size,
-                   zorder=5, edgecolors="black", linewidth=0.8, label=row["strategy"])
-        ax.annotate(
-            f"{row['strategy']}\\n({row['cost_pct']:.1f}% cost, {row['accuracy']:.4f} ± {row['accuracy_sd']:.4f})",
-            (row["cost_pct"], row["accuracy"]),
-            textcoords="offset points", xytext=(18, (-22, 16, -6)[offset % 3]),
-            fontsize=9, fontweight="bold", color=colour,
-            arrowprops=dict(arrowstyle="->", color=colour, lw=1.3),
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=colour, alpha=0.9))
+                   zorder=5, edgecolors="black", linewidth=0.8, label=NAMES[name])
+        key = (round(row["cost_pct"], 3), round(row["accuracy"], 3))
+        groups.setdefault(key, ([], row["accuracy_sd"]))[0].append(name)
 
-    ax.set_xlabel(f"Relative computational cost (% of full-resolution {COST})", fontsize=11)
+    # Fewer frames than offsets when strategies coincide, hence strict=False.
+    for offset, ((cost, acc), (names, acc_sd)) in zip(FRAME_OFFSETS, sorted(groups.items()), strict=False):
+        colour = STYLE[names[0]][1]
+        ax.annotate(
+            " = ".join(NAMES[n] for n in names) + f"\\n({cost:.1f}% cost, {acc:.4f} ± {acc_sd:.4f})",
+            xy=(cost, acc), xycoords="data",
+            xytext=offset, textcoords="offset points",
+            ha="center", va="top", fontsize=9, fontweight="bold", color=colour,
+            arrowprops=dict(arrowstyle="->", color=colour, lw=1.3, shrinkB=10),
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec=colour, alpha=0.95))
+
+    ax.set_xlabel(f"Relative computational cost (% of the native image, in {COST_LABEL})", fontsize=11)
     ax.set_ylabel("Out-of-fold accuracy", fontsize=11)
-    ax.set_title(f"{label} — {N_FOLDS}-fold CV, K={SUMMARY_K}: accuracy vs cost (mean ± std)", fontsize=13)
-    ax.legend(loc="lower right", fontsize=9)
+    ax.legend(loc="lower right", fontsize=11, markerscale=0.6, labelspacing=0.7, borderpad=0.8)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     fig.savefig(RESULTS_DIR / f"kfold_accuracy_vs_cost_{label}.pdf", bbox_inches="tight")
