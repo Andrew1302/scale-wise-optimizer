@@ -69,6 +69,38 @@ def cross_validate(
     return pd.DataFrame(rows)
 
 
+def cluster_accuracy(
+    sweep: Sweep,
+    embeddings: np.ndarray,
+    k: int,
+    fold: int = 0,
+    n_folds: int = 5,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Accuracy of every cluster at every budget, on one fold's training rows.
+
+    This is the matrix ``derive_policy`` reads: a row per cluster, a column per
+    budget, and the per-cluster argmax is what ``best`` assigns. Deliberately the
+    *training* rows of a single fold — it shows what the policy was fit on, not
+    how well it generalises, which is what the out-of-fold tables are for. The
+    split matches ``cross_validate`` exactly, so cluster ids line up with the
+    policies scored there.
+    """
+    splits = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    train, _ = list(splits.split(embeddings, sweep.subjects))[fold]
+
+    model = KMeans(n_clusters=k, random_state=random_state, n_init=10).fit(embeddings[train])
+    scores = sweep.scores[train]
+
+    table = pd.DataFrame(
+        [scores[model.labels_ == cluster].mean(axis=0) for cluster in range(k)],
+        index=pd.RangeIndex(k, name="cluster"),
+        columns=sweep.budgets,
+    )
+    table.insert(0, "n_questions", np.bincount(model.labels_, minlength=k))
+    return table
+
+
 def fixed_frontier(folds: pd.DataFrame) -> pd.DataFrame:
     """The fixed-budget accuracy/cost curve, averaged over folds and sorted by cost."""
     fixed = folds[folds["strategy"].str.startswith("fixed_")]
